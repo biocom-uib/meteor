@@ -213,7 +213,9 @@ fn load_host_prediction(args: &RefineHostPredictionArgs) -> anyhow::Result<(Lazy
 
         let reader = LazyCsvReader::new_paths(Arc::new([pathbuf]));
 
-        crate::csv::polars::default_tsv_options(reader).finish()?
+        crate::csv::polars::default_tsv_options(reader)
+            .with_chunk_size(5000)
+            .finish()?
     };
 
     use crate::merge_outputs::host_prediction::columns;
@@ -282,8 +284,6 @@ where
     HI: Interned<Symbol = DefaultSymbol, ValueHKT = HKTRef<str>> + Send + Sync + 'static,
 {
     use polars::lazy::dsl::col;
-
-    std::env::set_var("POLARS_STREAMING_CHUNK_SIZE", "5000");
 
     let output_type = GetOutput::from_type(enrichment_dtype(&evidence));
 

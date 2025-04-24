@@ -14,6 +14,7 @@ pub trait Enrichment<'a>: Default {
     type SummaryClassData: Default + Clone;
     type SummaryClassStats: SerializeFlat + From<Self::SummaryClassData>;
 
+    #[must_use]
     fn enrich<'r>(
         &mut self,
         context: Self::Context,
@@ -60,7 +61,6 @@ impl<'a> Enrichment<'a> for NoEnrichment {
     type SummaryClassData = NoEnrichmentData;
     type SummaryClassStats = NoEnrichmentData;
 
-    #[must_use]
     fn enrich<'r>(
         &mut self,
         _context: Self::Context,

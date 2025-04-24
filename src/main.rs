@@ -2,7 +2,6 @@
     associated_type_defaults,
     cmp_minmax,
     extend_one,
-    hash_raw_entry,
     hash_set_entry,
     impl_trait_in_assoc_type,
     io_error_more,

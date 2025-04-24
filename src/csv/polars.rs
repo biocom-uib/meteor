@@ -9,8 +9,8 @@ use polars::{
     error::PolarsResult,
     lazy::dsl::Expr,
     prelude::{
-        arity::unary_elementwise, ChunkedCollectIterExt, JoinBuilder, JoinCoalesce, JoinType,
-        JoinValidation, LazyCsvReader, LazyFileListReader, LazyFrame, Schema,
+        arity::unary_elementwise, ChunkedCollectIterExt, IntoColumn, JoinBuilder, JoinCoalesce,
+        JoinType, JoinValidation, LazyCsvReader, LazyFileListReader, LazyFrame, Schema,
     },
     series::{IntoSeries, Series},
 };
@@ -292,7 +292,7 @@ impl ExprExt for Expr {
         ChunkedArray<U>: IntoSeries
     {
         self.map(
-            move |series| Ok(Some(f(cast(&series)?).into_series())),
+            move |column| Ok(Some(f(cast(column.as_materialized_series())?).into_column())),
             GetOutput::from_type(U::get_dtype()),
         )
     }
@@ -304,7 +304,7 @@ impl ExprExt for Expr {
         T: PolarsDataType<IsNested = FalseT>,
     {
         self.map(
-            move |series| Ok(Some(f(cast(&series)?).into_series())),
+            move |column| Ok(Some(f(cast(column.as_materialized_series())?).into_column())),
             GetOutput::from_type(DataType::List(output_inner.boxed())),
         )
     }
@@ -318,13 +318,16 @@ impl ExprExt for Expr {
         ChunkedArray<U>: IntoSeries,
     {
         self.map_list(
-            move |series| {
-                let result = series.list()?.try_apply_amortized(|group| {
-                    let inner = inner_cast(group.as_ref())?;
-                    Ok(inner_f(inner).into_series())
-                })?;
+            move |column| {
+                let result = column
+                    .as_materialized_series()
+                    .list()?
+                    .try_apply_amortized(|group| {
+                        let inner = inner_cast(group.as_ref())?;
+                        Ok(inner_f(inner).into_series())
+                    })?;
 
-                Ok(Some(result.into_series()))
+                Ok(Some(result.into_column()))
             },
             GetOutput::from_type(DataType::List(U::get_dtype().boxed())),
         )

@@ -15,7 +15,8 @@ use crate::{
         tree::{
             walk::{LazyLcaCache, LcaCache, LcaCacheIndex, LcaCacheRange, LcaMapResult},
             NodeId,
-        }, Taxonomy
+        },
+        Taxonomy,
     },
 };
 

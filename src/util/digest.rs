@@ -11,6 +11,7 @@ use sha2::Digest;
 
 pub type Sha256Digest = impl Deref<Target = [u8]> + Clone + Debug;
 
+#[define_opaque(Sha256Digest)]
 pub fn sha256_file(path: &Path) -> io::Result<Box<Sha256Digest>> {
     let mut hasher = sha2::Sha256::new();
 

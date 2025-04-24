@@ -122,7 +122,7 @@ impl RankAssignments {
             Entry::Vacant(vac) => vac.insert(HashSet::new()),
         };
 
-        contigs.get_or_insert_owned(contig);
+        contigs.get_or_insert_with(contig, ToOwned::to_owned);
     }
 
     fn lookup_rank_node(&self, rank_node: NodeId) -> Option<(&NodeIdSet, &HashSet<String>)> {

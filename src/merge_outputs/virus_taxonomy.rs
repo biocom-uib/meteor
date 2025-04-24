@@ -128,7 +128,7 @@ where
             col("taxonomy")
                 .downcast_map_apply_str(genomad::lineage_most_specific)
         )
-        .rename(["taxonomy"], [columns::CLASS_NAMES])
+        .rename(["taxonomy"], [columns::CLASS_NAMES], true)
     } else {
         df.drop(["taxonomy"])
     };

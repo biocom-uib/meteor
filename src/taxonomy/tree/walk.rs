@@ -391,6 +391,7 @@ impl LcaCache {
         }
     }
 
+    #[define_opaque(LazyLcaCache)]
     pub fn compute_lazy<Tree: RootedTree + Send + Sync + 'static>(tree: Arc<Tree>) -> LazyLcaCache<Tree> {
         LazyLock::new(move || Self::compute(&*tree))
     }

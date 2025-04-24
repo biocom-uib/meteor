@@ -66,10 +66,10 @@ impl From<u32> for NodeId {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct NodeIdMap<T> {
-    inner: IntMap<T>,
+    inner: IntMap<u32, T>,
 }
 
-pub type Entry<'a, T> = intmap::Entry<'a, T>;
+pub type Entry<'a, T> = intmap::Entry<'a, u32, T>;
 
 impl<T> NodeIdMap<T> {
     #[inline(always)]
@@ -93,7 +93,7 @@ impl<T> NodeIdMap<T> {
 
     #[inline(always)]
     pub fn iter(&self) -> impl Iterator<Item = (NodeId, &T)> + '_ {
-        self.inner.iter().map(|(&k, v)| (NodeId(k as u32), v))
+        self.inner.iter().map(|(k, v)| (NodeId::from(k), v))
     }
 
     #[inline(always)]
@@ -180,7 +180,7 @@ impl<T> Extend<(NodeId, T)> for NodeIdMap<T> {
     }
 
     fn extend<I: IntoIterator<Item = (NodeId, T)>>(&mut self, iter: I) {
-        self.inner.extend(iter.into_iter().map(|(k, v)| (u64::from(k), v)))
+        self.inner.extend(iter.into_iter().map(|(k, v)| (u32::from(k), v)))
     }
 }
 
@@ -201,7 +201,7 @@ impl<'a, T> IntoIterator for &'a NodeIdMap<T> {
     type IntoIter = impl Iterator<Item = Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.inner.iter().map(|(&k, v)| (NodeId::from(k as u32), v))
+        self.inner.iter().map(|(k, v)| (NodeId::from(k as u32), v))
     }
 }
 
@@ -220,7 +220,7 @@ impl<T> FromIterator<(NodeId, T)> for NodeIdMap<T> {
 #[derive(Clone, Default, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct NodeIdSet {
-    inner: IntMap<()>,
+    inner: IntMap<u32, ()>,
 }
 
 impl NodeIdSet {
@@ -245,7 +245,7 @@ impl NodeIdSet {
 
     #[inline(always)]
     pub fn iter(&self) -> impl Iterator<Item = NodeId> + '_ {
-        self.inner.iter().map(|(&k, _)| NodeId::from(k as u32))
+        self.inner.iter().map(|(k, _)| NodeId::from(k))
     }
 
     #[inline(always)]
@@ -310,7 +310,7 @@ impl<'a> IntoIterator for &'a NodeIdSet {
     type IntoIter = impl Iterator<Item = NodeId>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.inner.iter().map(|(&k, _)| NodeId::from(k as u32))
+        self.inner.iter().map(|(k, _)| NodeId::from(k))
     }
 }
 
@@ -324,7 +324,7 @@ impl Extend<NodeId> for NodeIdSet {
     }
 
     fn extend<I: IntoIterator<Item = NodeId>>(&mut self, iter: I) {
-        self.inner.extend(iter.into_iter().map(|v| (u64::from(v), ())))
+        self.inner.extend(iter.into_iter().map(|v| (u32::from(v), ())))
     }
 }
 

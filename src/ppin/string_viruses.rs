@@ -77,7 +77,7 @@ impl StringProteinAliases<ProteinStringId> {
         })
     }
 
-    pub fn find_string_ids(&self, alias: &str) -> impl Iterator<Item = ProteinStringId> + '_ {
+    pub fn find_string_ids<'a>(&'a self, alias: &'a str) -> impl Iterator<Item = ProteinStringId> + use<'a> {
         self.mapping
             .lookup_syms(alias)
             .map(|(string_id, source)| ProteinStringId { string_id, source })
@@ -148,7 +148,7 @@ impl StringProteinAliases<ProteinAlias> {
         })
     }
 
-    pub fn find_aliases(&self, string_id: &str) -> impl Iterator<Item = ProteinAlias> + '_ {
+    pub fn find_aliases<'a>(&'a self, string_id: &'a str) -> impl Iterator<Item = ProteinAlias> + use<'a> {
         self.mapping
             .lookup_syms(string_id)
             .map(|(alias, source)| ProteinAlias { alias, source })

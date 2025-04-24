@@ -162,13 +162,11 @@ impl<'a, CE: Enrichment<'a>> EnrichmentSummary<'a, CE> {
     pub fn account_classes<'r>(&mut self, record: &EnrichedVpfClassRecord<'a, 'r, CE>) {
         let class_name = &*record.vpf_class_record.class_name;
 
-        self
-            .class_data
-            .raw_entry_mut()
-            .from_key(class_name)
-            .or_insert_with(|| (class_name.to_owned(), ClassData::default()))
-            .1
-            .add(record);
+        if let Some(data) = self.class_data.get_mut(class_name) {
+            data.add(record);
+        } else {
+            self.class_data.insert(class_name.to_owned(), ClassData::default());
+        }
     }
 
     pub fn write_classes<W: io::Write>(&self, writer: W, sort: SummarySortBy) -> csv::Result<()> {

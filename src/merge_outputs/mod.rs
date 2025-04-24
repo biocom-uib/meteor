@@ -15,7 +15,7 @@ use polars::{
     datatypes::DataType,
     frame::DataFrame,
     lazy::dsl::Expr,
-    prelude::{IntoLazy, LazyFrame, ListNameSpaceExtension},
+    prelude::{Column, IntoLazy, LazyFrame, ListNameSpaceExtension},
     series::Series,
 };
 use polars_arrow::array::PrimitiveArray;
@@ -278,8 +278,8 @@ where
     use polars::lazy::dsl::{col, cols};
 
     let init = DataFrame::new(vec![
-        Series::new_empty(VIRUS_NAME.into(), &DataType::String),
-        Series::new_empty(
+        Column::new_empty(VIRUS_NAME.into(), &DataType::String),
+        Column::new_empty(
             MERGED_TAXIDS.into(),
             &DataType::List(DataType::UInt32.boxed()),
         ),

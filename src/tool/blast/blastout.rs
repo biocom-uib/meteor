@@ -10,6 +10,7 @@ use ::polars::prelude::{
     col, LazyFileListReader, LazyFrame, NullValues, Schema,
 };
 use polars_plan::plans::ScanSources;
+use polars_utils::mmap::MemSlice;
 
 use crate::csv::filter::{FilterableRecord, FromStrField};
 use crate::csv::polars::{self, PolarsSchema};
@@ -179,11 +180,13 @@ impl BlastOutFmt {
     }
 
     pub fn load_lazyframe_from_static(&self, buf: &'static str) -> anyhow::Result<LazyFrame> {
-        self.load_lazyframe_from_sources(ScanSources::Buffers(Arc::new([buf.into()])))
+        let mem_slice = MemSlice::from_static(buf.as_bytes());
+        self.load_lazyframe_from_sources(ScanSources::Buffers(Arc::new([mem_slice])))
     }
 
     pub fn load_lazyframe_from_string(&self, buf: String) -> anyhow::Result<LazyFrame> {
-        self.load_lazyframe_from_sources(ScanSources::Buffers(Arc::new([buf.into()])))
+        let mem_slice = MemSlice::from(buf.into_bytes());
+        self.load_lazyframe_from_sources(ScanSources::Buffers(Arc::new([mem_slice])))
     }
 }
 

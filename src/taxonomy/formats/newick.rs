@@ -131,9 +131,9 @@ impl LabeledTaxonomy for NewickTaxonomy {
         self.labels.get(node).into_iter()
     }
 
-    type NodesWithLabel<'a> = impl Iterator<Item = NodeId> + 'a;
+    type NodesWithLabel<'a> = impl Iterator<Item = NodeId> + use<'a>;
 
-    fn nodes_with_label<'a>(&self, label: &str) -> Self::NodesWithLabel<'_> {
+    fn nodes_with_label<'a>(&'a self, label: &'a str) -> Self::NodesWithLabel<'a> {
         self.labels.nodes_with_label(label)
     }
 }

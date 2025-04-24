@@ -1,4 +1,4 @@
-use std::{env, sync::Arc};
+use std::sync::Arc;
 
 use clap::{Args, ValueEnum};
 use lending_iterator::{
@@ -371,8 +371,6 @@ where
 }
 
 pub fn refine_host_prediction(args: RefineHostPredictionArgs) -> anyhow::Result<()> {
-    env::set_var("POLARS_STREAMING_CHUNK_SIZE", "5000");
-
     eprintln!("Loading taxonomy");
     let taxonomy = args.taxonomy.deserialize()?;
 
