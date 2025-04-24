@@ -1,4 +1,4 @@
-use std::{fs::File, path::Path};
+use std::{fs::File, io::{BufReader, BufWriter}, path::Path};
 
 use anyhow::Context;
 use clap::{Args, ValueEnum};
@@ -20,12 +20,6 @@ pub struct PreprocessedTaxonomy {
     pub tree: SomeTaxonomy,
     pub ordered_ranks: Option<Vec<String>>,
     pub contraction_ranks: Option<Vec<String>>,
-}
-
-impl Default for PreprocessedTaxonomyFormat {
-    fn default() -> Self {
-        Self::Bincode
-    }
 }
 
 macro_rules! with_some_taxonomy {
@@ -56,8 +50,9 @@ macro_rules! with_some_ncbi_or_newick_taxonomy {
 pub(crate) use with_some_ncbi_or_newick_taxonomy;
 pub(crate) use with_some_taxonomy;
 
-#[derive(ValueEnum, Debug, Copy, Clone)]
+#[derive(ValueEnum, Debug, Default, Copy, Clone)]
 pub enum PreprocessedTaxonomyFormat {
+    #[default]
     Bincode,
     #[cfg(feature = "taxonomy-serialize-cbor")]
     Cbor,
@@ -99,14 +94,16 @@ impl PreprocessedTaxonomy {
         path: P,
         format: PreprocessedTaxonomyFormat,
     ) -> anyhow::Result<Self> {
+        let reader = BufReader::new(File::open(path)?);
+
         match format {
-            PreprocessedTaxonomyFormat::Bincode => Ok(bincode::deserialize_from(File::open(path)?)?),
+            PreprocessedTaxonomyFormat::Bincode => Ok(bincode::deserialize_from(reader)?),
 
-            #[cfg(feature ="taxonomy-serialize-cbor")]
-            PreprocessedTaxonomyFormat::Cbor => Ok(serde_cbor::from_reader(File::open(path)?)?),
+            #[cfg(feature = "taxonomy-serialize-cbor")]
+            PreprocessedTaxonomyFormat::Cbor => Ok(serde_cbor::from_reader(reader)?),
 
-            #[cfg(feature ="taxonomy-serialize-json")]
-            PreprocessedTaxonomyFormat::Json => Ok(serde_json::from_reader(File::open(path)?)?),
+            #[cfg(feature = "taxonomy-serialize-json")]
+            PreprocessedTaxonomyFormat::Json => Ok(serde_json::from_reader(reader)?),
         }
     }
 
@@ -115,17 +112,19 @@ impl PreprocessedTaxonomy {
         path: P,
         format: PreprocessedTaxonomyFormat,
     ) -> anyhow::Result<()> {
+        let writer = BufWriter::new(File::create(path)?);
+
         match format {
             PreprocessedTaxonomyFormat::Bincode => {
-                Ok(bincode::serialize_into(File::create(path)?, self)?)
+                Ok(bincode::serialize_into(writer, self)?)
             }
             #[cfg(feature ="taxonomy-serialize-cbor")]
             PreprocessedTaxonomyFormat::Cbor => {
-                Ok(serde_cbor::to_writer(File::create(path)?, self)?)
+                Ok(serde_cbor::to_writer(writer, self)?)
             }
             #[cfg(feature ="taxonomy-serialize-json")]
             PreprocessedTaxonomyFormat::Json => {
-                Ok(serde_json::to_writer(File::create(path)?, self)?)
+                Ok(serde_json::to_writer(writer, self)?)
             }
         }
     }
@@ -133,13 +132,13 @@ impl PreprocessedTaxonomy {
 
 #[derive(Args)]
 pub struct PreprocessedTaxonomyArgs {
-    /// Format in which the preprocessed taxonomy was serialized.
-    #[clap(long, value_enum, default_value_t, env = "METEOR_TAXONOMY_FORMAT")]
-    taxonomy_format: PreprocessedTaxonomyFormat,
-
     /// Path to the preprocessed taxonomy (from preprocess-taxonomy)
-    #[clap(long = "taxonomy", env = "METEOR_TAXONOMY")]
+    #[clap(help_heading = "Taxonomy", long = "taxonomy", env = "METEOR_TAXONOMY")]
     preprocessed_taxonomy: String,
+
+    /// Format in which the preprocessed taxonomy was serialized.
+    #[clap(help_heading = "Taxonomy", long, value_enum, default_value_t, env = "METEOR_TAXONOMY_FORMAT")]
+    taxonomy_format: PreprocessedTaxonomyFormat,
 }
 
 impl PreprocessedTaxonomyArgs {

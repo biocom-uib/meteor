@@ -73,7 +73,7 @@ impl BlastTool {
 impl CliTool for BlastTool {
     fn new_command(&self) -> Command {
         if let Some(prefix) = &self.install_prefix {
-            Command::new(&prefix.join("bin").join(&self.command))
+            Command::new(prefix.join("bin").join(&self.command))
         } else {
             Command::new(&self.command)
         }

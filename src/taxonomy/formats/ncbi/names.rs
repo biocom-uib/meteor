@@ -5,12 +5,15 @@ use std::{collections::HashMap, fs::File, io::BufReader, path::Path};
 use serde::{Deserialize, Serialize};
 use string_interner::{symbol::SymbolU32, DefaultStringInterner, StringInterner, Symbol};
 
+use crate::taxonomy::tree::node_id::{Entry, NodeIdMap};
 use crate::taxonomy::NodeId;
 
 use super::dmp::{parse_fields, DmpError};
 use super::TaxId;
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[repr(transparent)]
+#[serde(transparent)]
 pub struct NameClassSymbol(u32);
 
 impl From<SymbolU32> for NameClassSymbol {
@@ -28,7 +31,7 @@ impl From<NameClassSymbol> for SymbolU32 {
 #[derive(Default, Serialize, Deserialize)]
 pub struct AllNames {
     pub name_classes: DefaultStringInterner,
-    pub taxid_to_names: HashMap<TaxId, Vec<(NameClassSymbol, String)>>,
+    pub taxid_to_names: NodeIdMap<Vec<(NameClassSymbol, String)>>,
     pub name_to_taxids: HashMap<String, Vec<(NameClassSymbol, TaxId)>>,
 }
 
@@ -42,7 +45,7 @@ impl AllNames {
     {
         let mut this = AllNames {
             name_classes: StringInterner::new(),
-            taxid_to_names: HashMap::new(),
+            taxid_to_names: NodeIdMap::new(),
             name_to_taxids: HashMap::new(),
         };
 
@@ -115,7 +118,7 @@ impl AllNames {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SingleClassNames {
     pub name_class: String,
-    pub taxid_to_name: HashMap<TaxId, String>,
+    pub taxid_to_name: NodeIdMap<String>,
     pub name_to_taxids: HashMap<String, Vec<TaxId>>,
 }
 
@@ -128,7 +131,7 @@ impl SingleClassNames {
     ) -> Result<Self, DmpError> {
         let mut this = SingleClassNames {
             name_class,
-            taxid_to_name: HashMap::new(),
+            taxid_to_name: NodeIdMap::new(),
             name_to_taxids: HashMap::new(),
         };
 
@@ -207,10 +210,12 @@ impl NamesAssoc for AllNames {
 
         let name_class = self.name_classes.get_or_intern(name_class).into();
 
-        self.taxid_to_names
-            .entry(taxid)
-            .or_default()
-            .push((name_class, chosen_name.to_owned()));
+        let names = match self.taxid_to_names.entry(taxid) {
+            Entry::Occupied(occ) => occ.into_mut(),
+            Entry::Vacant(vac) => vac.insert(Vec::new()),
+        };
+
+        names.push((name_class, chosen_name.to_owned()));
 
         self.name_to_taxids
             .entry(chosen_name.to_owned())
@@ -219,7 +224,7 @@ impl NamesAssoc for AllNames {
     }
 
     fn forget_taxids<Keep: FnMut(TaxId) -> bool>(&mut self, mut keep: Keep) {
-        self.taxid_to_names.retain(|taxid, _| keep(*taxid));
+        self.taxid_to_names.retain(|taxid, _| keep(taxid));
 
         self.name_to_taxids.retain(|_, taxids| {
             taxids.retain(|(_, taxid)| keep(*taxid));
@@ -229,7 +234,7 @@ impl NamesAssoc for AllNames {
 
     type NameLookup = Vec<(NameClassSymbol, String)>;
     fn lookup_names(&self, taxid: TaxId) -> Option<&Self::NameLookup> {
-        self.taxid_to_names.get(&taxid)
+        self.taxid_to_names.get(taxid)
     }
 
     type NamesLookupIter<'a> = IterStrSnd<slice::Iter<'a, (NameClassSymbol, String)>>;
@@ -271,9 +276,10 @@ impl<'a, T: 'a, U: 'a + Copy, I: Iterator<Item = &'a (T, U)>> Iterator for IterC
 impl NamesAssoc for SingleClassNames {
     fn insert(&mut self, taxid: TaxId, name: &str, unique_name: &str, name_class: &str) {
         if name_class == self.name_class {
-            self.taxid_to_name
-                .entry(taxid)
-                .or_insert_with(|| if name.is_empty() { unique_name } else { name }.to_owned());
+            if let Entry::Vacant(vac) = self.taxid_to_name.entry(taxid) {
+                let chosen_name = if name.is_empty() { unique_name } else { name };
+                vac.insert(chosen_name.to_owned());
+            }
 
             self.name_to_taxids
                 .entry(name.to_owned())
@@ -286,7 +292,7 @@ impl NamesAssoc for SingleClassNames {
     where
         Keep: FnMut(TaxId) -> bool,
     {
-        self.taxid_to_name.retain(|taxid, _| keep(*taxid));
+        self.taxid_to_name.retain(|taxid, _| keep(taxid));
 
         self.name_to_taxids.retain(|_, taxids| {
             taxids.retain(|taxid| keep(*taxid));
@@ -296,12 +302,12 @@ impl NamesAssoc for SingleClassNames {
 
     type NameLookup = String;
     fn lookup_names(&self, taxid: TaxId) -> Option<&Self::NameLookup> {
-        self.taxid_to_name.get(&taxid)
+        self.taxid_to_name.get(taxid)
     }
 
     type NamesLookupIter<'a> = std::iter::Once<&'a str>;
     fn iter_lookup_names(lookup: &Self::NameLookup) -> Self::NamesLookupIter<'_> {
-        std::iter::once(&*lookup)
+        std::iter::once(lookup)
     }
 
     type TaxIdsLookup = Vec<TaxId>;

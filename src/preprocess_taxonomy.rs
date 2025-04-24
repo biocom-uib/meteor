@@ -44,7 +44,7 @@ pub struct PreprocessTaxonomyArgs {
     input_taxonomy: String,
 
     /// Comma-separated list of name classes to load (if INPUT_FORMAT is ncbi)
-    #[clap(long, default_value = "scientific name,synonym")]
+    #[clap(long, default_value = "scientific name,synonym,equivalent name,common name,acronym,blast name,genbank acronym,genbank common name,includes,in-part" )]
     ncbi_name_classes: String,
 
     /// Comma-separated list of rank names to associate to each level of the Newick taxonomy (if

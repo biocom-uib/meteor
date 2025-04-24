@@ -4,7 +4,7 @@ use anyhow::Context;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::util::{cli_tools::{self, CliTool, BlastTool}, interned_mapping::InternedMultiMapping};
+use crate::util::{cli_tools::{self, CliTool, BlastTool}, interned_mapping::InternedMapping};
 
 use super::VirusHostMapping;
 
@@ -208,7 +208,7 @@ impl MincedSpacersPipeline {
         let file_reader = File::open(self.work_dir.join(BLASTOUT_FILE_NAME))
             .context("Reading blastn output")?;
 
-        let mapping = InternedMultiMapping::read_tsv_with(file_reader, false, |record| {
+        let mapping = InternedMapping::read_tsv_with(file_reader, false, |record| {
             let record = record.deserialize::<SpacersBlastRecord>(None)?;
 
             if let Some(suffix_match) = spacer_suffix_regex.find(record.spacer_name) {

@@ -1,12 +1,18 @@
-use std::{collections::{HashSet, HashMap}, io};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+};
 
 use clap::ValueEnum;
 use itertools::Itertools;
-use serde::{Serialize, ser::SerializeStruct, Serializer};
+use serde::{ser::SerializeStruct, Serialize, Serializer};
 
-use crate::{taxonomy::NodeId, util::csv_flatten_fix::{SerializeFlat, serialize_flat_struct}};
+use crate::{
+    csv::flatten_fix::{serialize_flat_struct, SerializeFlat},
+    taxonomy::tree::node_id::NodeIdSet,
+};
 
-use super::enrichment::{EnrichedVpfClassRecord, Enrichment, NoEnrichment, CrisprEnrichment};
+use super::enrichment::{CrisprEnrichment, EnrichedVpfClassRecord, Enrichment, NoEnrichment};
 
 
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -25,14 +31,14 @@ pub struct RecordDropStats {
     num_no_crispr_info: u32,
 }
 
-struct ClassData<'a, CE: Enrichment> {
+struct ClassData<'a, CE: Enrichment<'a>> {
     virus_count: u32,
-    assigned_taxids: HashSet<NodeId>,
+    assigned_taxids: NodeIdSet,
     assigned_contigs: HashSet<&'a str>,
     crispr_enrichment_data: CE::SummaryClassData,
 }
 
-struct ClassStats<CE: Enrichment> {
+struct ClassStats<'a, CE: Enrichment<'a>> {
     class_name: String,
     virus_count: i32,
     num_assigned_taxids: i32,
@@ -46,7 +52,7 @@ impl RecordDropStats {
     }
 }
 
-impl<'a, CE: Enrichment> Default for ClassData<'a, CE> {
+impl<'a, CE: Enrichment<'a>> Default for ClassData<'a, CE> {
     fn default() -> Self {
         Self {
             virus_count: Default::default(),
@@ -57,8 +63,8 @@ impl<'a, CE: Enrichment> Default for ClassData<'a, CE> {
     }
 }
 
-impl<'a, CE: Enrichment> ClassData<'a, CE> {
-    fn add<S>(&mut self, record: &EnrichedVpfClassRecord<'a, S, CE>) {
+impl<'a, CE: Enrichment<'a>> ClassData<'a, CE> {
+    fn add<'r>(&mut self, record: &EnrichedVpfClassRecord<'a, 'r, CE>) {
         self.virus_count += 1;
         self.assigned_taxids.extend(&record.assigned_taxids);
         self.assigned_contigs.extend(&record.assigned_contigs);
@@ -67,7 +73,7 @@ impl<'a, CE: Enrichment> ClassData<'a, CE> {
     }
 }
 
-impl<CE: Enrichment> SerializeFlat for ClassStats<CE> {
+impl<'a, CE: Enrichment<'a>> SerializeFlat for ClassStats<'a, CE> {
     const FIELD_COUNT: usize = 4 + CE::SummaryClassStats::FIELD_COUNT;
 
     fn serialize_flat<Ser: SerializeStruct>(&self, row: &mut Ser) -> Result<(), Ser::Error> {
@@ -80,7 +86,7 @@ impl<CE: Enrichment> SerializeFlat for ClassStats<CE> {
     }
 }
 
-impl<CE: Enrichment> Serialize for ClassStats<CE> {
+impl<'a, CE: Enrichment<'a>> Serialize for ClassStats<'a, CE> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serialize_flat_struct(serializer, "ClassStats", self)
     }
@@ -95,13 +101,13 @@ pub enum SummarySortBy {
     AssignedContigs,
 }
 
-pub struct EnrichmentSummary<'a, CE: Enrichment> {
+pub struct EnrichmentSummary<'a, CE: Enrichment<'a>> {
     class_data: HashMap<String, ClassData<'a, CE>>,
     dropped: RecordDropStats,
     num_records: u32,
 }
 
-impl<'a, CE: Enrichment> Default for EnrichmentSummary<'a, CE> {
+impl<'a, CE: Enrichment<'a>> Default for EnrichmentSummary<'a, CE> {
     fn default() -> Self {
         Self {
             class_data: Default::default(),
@@ -111,7 +117,7 @@ impl<'a, CE: Enrichment> Default for EnrichmentSummary<'a, CE> {
     }
 }
 
-impl<'a, CE: Enrichment> EnrichmentSummary<'a, CE> {
+impl<'a, CE: Enrichment<'a>> EnrichmentSummary<'a, CE> {
     pub fn num_records(&self) -> u32 {
         self.num_records
     }
@@ -153,8 +159,8 @@ impl<'a, CE: Enrichment> EnrichmentSummary<'a, CE> {
         }
     }
 
-    pub fn account_classes<S: AsRef<str>>(&mut self, record: &EnrichedVpfClassRecord<'a, S, CE>) {
-        let class_name = record.vpf_class_record.class_name.as_ref();
+    pub fn account_classes<'r>(&mut self, record: &EnrichedVpfClassRecord<'a, 'r, CE>) {
+        let class_name = &*record.vpf_class_record.class_name;
 
         self
             .class_data

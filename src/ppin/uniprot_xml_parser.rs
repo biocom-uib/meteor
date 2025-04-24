@@ -217,9 +217,8 @@ impl<R: BufRead> UniProtXmlReader<R> {
     pub fn new(reader: R) -> Self {
         let mut xml_reader = Reader::from_reader(reader);
 
-        xml_reader
-            .expand_empty_elements(true)
-            .trim_text(true);
+        xml_reader.config_mut().expand_empty_elements = true;
+        xml_reader.config_mut().trim_text(true);
 
         Self {
             xml_reader,

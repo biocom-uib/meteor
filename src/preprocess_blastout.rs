@@ -4,12 +4,12 @@ use clap::{Args, ValueEnum};
 use polars::datatypes::DataType;
 use polars::lazy::prelude::Expr;
 use polars::prelude::{
-    col, CsvWriter, GetOutput, LazyFrame, SerWriter, UniqueKeepStrategy
+    col, lit, CsvWriter, LazyFrame, SerWriter, UniqueKeepStrategy
 };
-use polars::series::Series;
 
-use crate::tool::blast::blastout;
-use crate::util::{self, filter::FromStrFilter, writing_new_file_or_stdout};
+use crate::csv::filter::Filter;
+use crate::tool::blast::blastout::{BlastOutFilter, BlastOutFmt};
+use crate::util::{self, writing_new_file_or_stdout};
 
 
 #[derive(ValueEnum, Debug, Default, Copy, Clone)]
@@ -75,26 +75,35 @@ pub struct PreprocessBlastOutArgs {
 
     /// Filters to apply before processing. Example: --filter 'evalue<=1e-3'
     #[clap(long)]
-    filter: Vec<String>,
+    filter: Vec<BlastOutFilter>,
 }
 
 fn aggregate_subjects(subject_id: Expr) -> Expr {
     subject_id.str().join(";", true)
 }
 
-fn group_blast_hits(hits: LazyFrame, query_id_col: &str, subject_id_col: &str) -> LazyFrame {
-    hits.filter(
-        col(query_id_col)
-            .is_not_null()
-            .and(col(subject_id_col).is_not_null()),
-    )
-    .select([
-        col(query_id_col),
-        col(subject_id_col).cast(DataType::String)
-    ])
-    .unique(None, UniqueKeepStrategy::First)
-    .group_by([col(query_id_col)])
-    .agg([aggregate_subjects(col(subject_id_col))])
+fn group_blast_hits(
+    hits: LazyFrame,
+    query_id_col: &str,
+    subject_id_col: &str,
+    stable: bool,
+) -> LazyFrame {
+    let hits = hits
+        .drop_nulls(Some(vec![col(query_id_col), col(subject_id_col)]))
+        .select([
+            col(query_id_col),
+            col(subject_id_col).cast(DataType::String),
+        ]);
+
+    let hits = if stable {
+        hits.unique_stable(None, UniqueKeepStrategy::First)
+            .group_by_stable([col(query_id_col)])
+    } else {
+        hits.unique(None, UniqueKeepStrategy::First)
+            .group_by([col(query_id_col)])
+    };
+
+    hits.agg([aggregate_subjects(col(subject_id_col))])
 }
 
 fn group_blast_hits_with_weights(
@@ -103,63 +112,51 @@ fn group_blast_hits_with_weights(
     subject_id_col: &str,
     weight_col: &str,
     weight_col_agg: impl FnOnce(Expr) -> Expr,
+    stable: bool,
 ) -> LazyFrame {
     let zipped_subject_col = format!("{subject_id_col}/{weight_col}");
 
-    hits.filter(
-        col(query_id_col)
-            .is_not_null()
-            .and(col(subject_id_col).is_not_null())
-            .and(col(weight_col).is_not_null()),
-    )
-    .select([
-        col(query_id_col),
-        col(subject_id_col).cast(DataType::String),
-        col(weight_col),
-    ])
-    .group_by([col(query_id_col), col(subject_id_col)])
-    .agg([weight_col_agg(col(weight_col))])
-    .select([
-        col(query_id_col),
-        col(subject_id_col)
-            .map_many(
-                |params: &mut [Series]| {
-                    let ids = params[0].str()?;
+    let hits = hits
+        .drop_nulls(Some(vec![
+            col(query_id_col),
+            col(subject_id_col),
+            col(weight_col),
+        ]))
+        .select([
+            col(query_id_col),
+            col(subject_id_col).cast(DataType::String),
+            col(weight_col),
+        ]);
 
-                    let ws = params[1].cast(&DataType::String)?;
-                    let ws = ws.str()?;
+    let hits = if stable {
+        hits.group_by_stable([col(query_id_col), col(subject_id_col)])
+    } else {
+        hits.group_by([col(query_id_col), col(subject_id_col)])
+    };
 
-                    let result = itertools::izip!(ids, ws)
-                        .map(|(id, w)| format!("{}/{}", id.unwrap_or(""), w.unwrap_or("")))
-                        .collect::<Series>();
-
-                    Ok(Some(result))
-                },
-                &[col(weight_col)],
-                GetOutput::from_type(DataType::String),
-            )
-            .alias(&zipped_subject_col),
-    ])
-    .group_by([col(query_id_col)])
-    .agg([aggregate_subjects(col(&zipped_subject_col))])
+    hits.agg([weight_col_agg(col(weight_col))])
+        .select([
+            col(query_id_col),
+            (col(subject_id_col) + lit("/") + col(weight_col).cast(DataType::String))
+                .alias(&zipped_subject_col),
+        ])
+        .group_by([col(query_id_col)])
+        .agg([aggregate_subjects(col(&zipped_subject_col))])
 }
 
 pub fn preprocess_blastout(args: PreprocessBlastOutArgs) -> anyhow::Result<()> {
     let df = {
         let format = args
             .blast_outfmt
-            .parse()
+            .parse::<BlastOutFmt>()
             .context("Error parsing blast outfmt specifier")?;
 
-        let mut df = blastout::load_blastout(&args.blastout_path, &format, None)
+        let mut df = format.load_lazyframe_from_path(args.blastout_path.as_ref())
             .context("Error loading blast output")?;
 
-        eprintln!("Loaded BLAST+ output with schema {:?}", df.schema());
+        eprintln!("Loaded BLAST+ output with schema {:?}", df.collect_schema()?);
 
-        let filters = blastout::BlastOutFilter::parse_filters(&args.filter)
-            .context("Error parsing --filter")?;
-
-        blastout::apply_filters(df, filters)
+        Filter::apply_polars(df, &args.filter)
     };
 
     let grouped = if let Some(weight_col) = &args.weight_col {
@@ -171,9 +168,10 @@ pub fn preprocess_blastout(args: PreprocessBlastOutArgs) -> anyhow::Result<()> {
             &args.subject_id_col,
             weight_col,
             weight_col_agg,
+            false,
         )
     } else {
-        group_blast_hits(df, &args.query_id_col, &args.subject_id_col)
+        group_blast_hits(df, &args.query_id_col, &args.subject_id_col, false)
     };
 
     let mut grouped = grouped.collect()?;
@@ -181,14 +179,11 @@ pub fn preprocess_blastout(args: PreprocessBlastOutArgs) -> anyhow::Result<()> {
     //for col_name in grouped.get_column_names_owned() {
     //    if let DataType::List(inner_dtype) = grouped.column(&col_name)?.dtype() {
     //        let inner_dtype_is_string = inner_dtype.is_string();
-
     //        grouped.try_apply(&col_name, |series| {
     //            let mut series = Cow::Borrowed(series);
-
     //            if !inner_dtype_is_string {
-    //                series = Cow::Owned(series.cast(&DataType::List(Box::new(DataType::String)))?);
+    //                series = Cow::Owned(series.cast(&DataType::List(DataType::String.boxed()))?);
     //            }
-
     //            Ok(series.list()?.join_literal(";", true)?.into_series())
     //        })?;
     //    }
@@ -205,4 +200,52 @@ pub fn preprocess_blastout(args: PreprocessBlastOutArgs) -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use itertools::Itertools;
+
+    use crate::tool::blast::blastout::{self, BlastOutFmt};
+
+    #[test]
+    fn test_group_blast_hits() {
+        let fmt = BlastOutFmt::from_str(blastout::tests::BLAST_OUT_FMT).unwrap();
+
+        let df = fmt
+            .load_lazyframe_from_static(blastout::tests::BLAST_OUT)
+            .unwrap();
+
+        let result = super::group_blast_hits(df, "qaccver", "saccver", true)
+            .collect()
+            .unwrap();
+
+        let columns = result.get_columns();
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name().as_str(), "qaccver");
+        assert_eq!(columns[1].name().as_str(), "saccver");
+
+        let qaccver = Vec::from_iter(columns[0].str().unwrap());
+        assert_eq!(qaccver, vec![Some("c1"), Some("c2")]);
+
+        let saccver = columns[1]
+            .str()
+            .unwrap()
+            .iter()
+            .map(|group| {
+                Some(group?.split(';').map(str::to_owned).sorted().collect_vec())
+            })
+            .collect_vec();
+
+        assert_eq!(
+            saccver,
+            vec![
+                Some(vec!["CP034340.1".to_owned(), "CP034345.1".to_owned()]),
+                Some(vec!["CP034343.1".to_owned(), "CP034345.1".to_owned()]),
+            ],
+        );
+    }
 }

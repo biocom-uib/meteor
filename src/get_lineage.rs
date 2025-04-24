@@ -6,18 +6,23 @@ use itertools::Itertools;
 
 use crate::{
     preprocessed_taxonomy::{with_some_taxonomy, PreprocessedTaxonomyArgs},
-    taxonomy::LabelledTaxonomy, util,
+    taxonomy::{tree::{node_id::NodeIdSet, walk::RootedTreeWalk}, LabeledTaxonomy},
+    util,
 };
 
 /// Obtain lineage information from a list of taxids. The input is provided as a taxid per line on
-/// STDIN.
+/// STDIN. If a taxid is not found in the taxonomy, it is skipped with a warning message to STDERR.
 #[derive(Args)]
 pub struct GetLineageArgs {
     #[clap(flatten)]
     taxonomy: PreprocessedTaxonomyArgs,
+
+    /// Do not skip duplicates (better for shell pipes)
+    #[clap(long)]
+    keep_duplicates: bool,
 }
 
-pub fn get_lineage_with_taxonomy(taxo: &impl LabelledTaxonomy) -> anyhow::Result<()> {
+pub fn get_lineage_with_taxonomy(tax: &impl LabeledTaxonomy, keep_duplicates: bool) -> anyhow::Result<()> {
     let mut output = csv::WriterBuilder::new()
         .delimiter(b'\t')
         .from_writer(std::io::stdout());
@@ -26,7 +31,9 @@ pub fn get_lineage_with_taxonomy(taxo: &impl LabelledTaxonomy) -> anyhow::Result
 
     let stdin_lines = std::io::stdin().lock().lines();
 
-    itertools::process_results(stdin_lines, |lines| -> anyhow::Result<()> {
+    let mut duplicates = NodeIdSet::new();
+
+    stdin_lines.process_results(|lines| -> anyhow::Result<()> {
         for line in lines {
             let line = line.trim();
 
@@ -38,17 +45,21 @@ pub fn get_lineage_with_taxonomy(taxo: &impl LabelledTaxonomy) -> anyhow::Result
                 .parse()
                 .with_context(|| format!("Unable to parse input taxid: {line:?}"))?;
 
-            let taxid = if let Some(taxid) = taxo.fixup_node(taxid) {
+            let taxid = if let Some(taxid) = tax.fixup_node(taxid) {
                 taxid
             } else {
                 eprintln!("Warning: Unknown input taxid {taxid}, skipping");
                 continue;
             };
 
-            let root = taxo.get_root();
+            if keep_duplicates && !duplicates.insert(taxid) {
+                continue
+            }
+
+            let root = tax.get_root();
 
             let ancestors = iter::once(taxid)
-                .chain(taxo.strict_ancestors(taxid).filter(|ancestor| *ancestor != root))
+                .chain(tax.strict_ancestors(taxid).filter(|ancestor| *ancestor != root))
                 .collect_vec()
                 .into_iter()
                 .rev();
@@ -56,8 +67,8 @@ pub fn get_lineage_with_taxonomy(taxo: &impl LabelledTaxonomy) -> anyhow::Result
             let (lineage_taxids, lineage_labels, lineage_ranks): (Vec<_>, Vec<_>, Vec<_>) =
                 ancestors
                     .map(|ancestor_id| {
-                        let label = taxo.some_label_of(ancestor_id).unwrap_or("");
-                        let rank = taxo.find_rank_str(ancestor_id).unwrap_or("");
+                        let label = tax.some_label_of(ancestor_id).unwrap_or("");
+                        let rank = tax.find_rank_str(ancestor_id).unwrap_or("");
                         (ancestor_id.to_string(), label, rank)
                     })
                     .multiunzip();
@@ -86,6 +97,6 @@ pub fn get_lineage(args: GetLineageArgs) -> anyhow::Result<()> {
     eprintln!("Loaded taxonomy in {} seconds", now.elapsed().as_secs());
 
     with_some_taxonomy!(&taxonomy.tree, tax => {
-        util::ignore_broken_pipe_anyhow(get_lineage_with_taxonomy(tax))
+        util::ignore_broken_pipe_anyhow(get_lineage_with_taxonomy(tax, args.keep_duplicates))
     })
 }

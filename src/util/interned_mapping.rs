@@ -1,100 +1,28 @@
-use std::{collections::{HashMap, HashSet}, hash::Hash, io, marker::PhantomData};
+use std::{collections::{HashMap, HashSet}, io};
 
 use csv::StringRecord;
 use lending_iterator::prelude::*;
-use string_interner::{backend::Backend, DefaultStringInterner, DefaultSymbol, StringInterner};
 
-use super::csv_stream::CsvReaderIter;
+use crate::csv::stream::CsvReaderIter;
 
+use super::interners::{Interned, Interner, Resolver, InternedValue};
 
-pub trait Interner: Default {
-    type Value<'a>: Copy;
-    type Symbol: Copy + Eq + Ord + Hash;
-
-    fn get(&self, value: Self::Value<'_>) -> Option<Self::Symbol>;
-    fn get_or_intern(&mut self, value: Self::Value<'_>) -> Self::Symbol;
-    fn resolve(&self, sym: Self::Symbol) -> Option<Self::Value<'_>>;
-}
-
-impl<B: Backend> Interner for StringInterner<B>
+pub struct InternedMapping<KeyInterner, ValueInterner>
 where
-    StringInterner<B>: Default,
-    B::Symbol: Ord + Hash,
+    KeyInterner: Resolver,
+    ValueInterner: Resolver,
 {
-    type Value<'a> = &'a str;
-    type Symbol = B::Symbol;
-
-    fn get(&self, value: &str) -> Option<Self::Symbol> {
-        StringInterner::get(self, value)
-    }
-
-    fn get_or_intern(&mut self, value: &str) -> Self::Symbol {
-        StringInterner::get_or_intern(self, value)
-    }
-
-    fn resolve(&self, symbol: Self::Symbol) -> Option<&str> {
-        StringInterner::resolve(self, symbol)
-    }
-}
-
-pub struct TrivialInterner<T: Copy + Eq + Ord + Hash>(PhantomData<T>);
-
-impl<T: Copy + Eq + Ord + Hash> Default for TrivialInterner<T> {
-    fn default() -> Self {
-        Self(PhantomData)
-    }
-}
-
-impl<T: Copy + Eq + Ord + Hash> Interner for TrivialInterner<T> {
-    type Value<'a> = T;
-
-    type Symbol = T;
-
-    fn get(&self, value: Self::Value<'_>) -> Option<Self::Symbol> {
-        Some(value)
-    }
-
-    fn get_or_intern(&mut self, value: Self::Value<'_>) -> Self::Symbol {
-        value
-    }
-
-    fn resolve(&self, sym: Self::Symbol) -> Option<Self::Value<'_>> {
-        Some(sym)
-    }
-}
-
-#[derive(Default)]
-pub struct PairInterner<I1: Interner = DefaultStringInterner, I2: Interner = I1>(pub I1, pub I2);
-
-impl<I1: Interner, I2: Interner> Interner for PairInterner<I1, I2> {
-    type Value<'a> = (I1::Value<'a>, I2::Value<'a>);
-
-    type Symbol = (I1::Symbol, I2::Symbol);
-
-    fn get(&self, value: Self::Value<'_>) -> Option<Self::Symbol> {
-        Some((self.0.get(value.0)?, self.1.get(value.1)?))
-    }
-
-    fn get_or_intern(&mut self, value: Self::Value<'_>) -> Self::Symbol {
-        (self.0.get_or_intern(value.0), self.1.get_or_intern(value.1))
-    }
-
-    fn resolve(&self, sym: Self::Symbol) -> Option<Self::Value<'_>> {
-        Some((self.0.resolve(sym.0)?, self.1.resolve(sym.1)?))
-    }
-}
-
-pub struct InternedMultiMapping<ValueInterner = DefaultStringInterner>
-where
-    ValueInterner: Interner,
-{
-    key_interner: DefaultStringInterner,
+    key_interner: KeyInterner,
     value_interner: ValueInterner,
 
-    mapping: HashMap<DefaultSymbol, HashSet<ValueInterner::Symbol>>,
+    mapping: HashMap<KeyInterner::Symbol, HashSet<ValueInterner::Symbol>>,
 }
 
-impl<ValueInterner: Interner> Default for InternedMultiMapping<ValueInterner> {
+impl<KeyInterner, ValueInterner> Default for InternedMapping<KeyInterner, ValueInterner>
+where
+    KeyInterner: Default + Resolver,
+    ValueInterner: Default + Resolver,
+{
     fn default() -> Self {
         Self {
             key_interner: Default::default(),
@@ -104,20 +32,38 @@ impl<ValueInterner: Interner> Default for InternedMultiMapping<ValueInterner> {
     }
 }
 
-pub trait IntoValues<'a, I: Interner>: IntoIterator<Item = I::Value<'a>> {}
+pub trait IntoValues<'a, I: Resolver + 'a>: IntoIterator<Item = InternedValue<'a, I>> {}
 
 impl<'a, I, Iter> IntoValues<'a, I> for Iter
 where
-    I: Interner,
-    Iter: IntoIterator<Item = I::Value<'a>>,
+    I: Resolver + 'a,
+    Iter: IntoIterator<Item = InternedValue<'a, I>>,
 {
 }
 
-impl<ValueInterner> InternedMultiMapping<ValueInterner>
+impl<KeyInterner, ValueInterner> InternedMapping<KeyInterner, ValueInterner>
 where
-    ValueInterner: Interner,
+    KeyInterner: Resolver,
+    ValueInterner: Resolver,
 {
-    pub fn key_interner(&self) -> &DefaultStringInterner {
+    pub fn new(key_interner: KeyInterner, value_interner: ValueInterner) -> Self {
+        Self {
+            key_interner,
+            value_interner,
+            mapping: Default::default(),
+        }
+    }
+
+    pub fn get(
+        &self,
+        key_sym: KeyInterner::Symbol,
+    ) -> Option<impl Iterator<Item = ValueInterner::Symbol> + '_> {
+        self.mapping
+            .get(&key_sym)
+            .map(|set| set.iter().copied())
+    }
+
+    pub fn key_interner(&self) -> &KeyInterner {
         &self.key_interner
     }
 
@@ -125,82 +71,54 @@ where
         &self.value_interner
     }
 
-    pub fn add(&mut self, key: &str, value: ValueInterner::Value<'_>) {
-        let value_sym = self.value_interner.get_or_intern(value);
+    pub fn replace_interners<KeyInterner2, ValueInterner2, F>(
+        self,
+        f: F,
+    ) -> InternedMapping<KeyInterner2, ValueInterner2>
+    where
+        KeyInterner2: Resolver<Symbol = KeyInterner::Symbol>,
+        ValueInterner2: Resolver<Symbol = ValueInterner::Symbol>,
+        F: FnOnce(KeyInterner, ValueInterner) -> (KeyInterner2, ValueInterner2),
+    {
+        let (key_interner, value_interner) = f(self.key_interner, self.value_interner);
+
+        InternedMapping {
+            key_interner,
+            value_interner,
+            mapping: self.mapping,
+        }
+    }
+}
+
+impl<KeyInterner, ValueInterner> InternedMapping<KeyInterner, ValueInterner>
+where
+    KeyInterner: Interner<ValueHKT = HKTRef<str>>,
+    ValueInterner: Interner,
+{
+    pub fn add<'a, 'b>(&mut self, key: InternedValue<'a, KeyInterner>, value: InternedValue<'b, ValueInterner>)
+    where
+        KeyInterner: 'a,
+        ValueInterner: 'b,
+    {
         let key_sym = self.key_interner.get_or_intern(key);
+        let value_sym = self.value_interner.get_or_intern(value);
 
         self.mapping.entry(key_sym).or_default().insert(value_sym);
     }
+}
 
-    #[apply(Gat!)]
-    pub fn try_add_many<'a, Iter, E>(&'a mut self, mut iter: Iter) -> Result<(), E>
+impl<KeyInterner, ValueInterner> InternedMapping<KeyInterner, ValueInterner>
+where
+    KeyInterner: Interned,
+    ValueInterner: Resolver,
+{
+    pub fn lookup_syms<'b, 'a: 'b>(
+        &'a self,
+        key: InternedValue<'b, KeyInterner>,
+    ) -> impl Iterator<Item = ValueInterner::Symbol> + 'a
     where
-        Iter: for<'n> LendingIterator<Item<'n> = Result<(&'n str, ValueInterner::Value<'n>), E>>,
+        KeyInterner: 'b,
     {
-        let mut entry_cache_key = String::new();
-        let mut entry_cache_values: Option<&mut HashSet<ValueInterner::Symbol>> = None;
-
-        while let Some(result) = iter.next() {
-            let (key, value) = result?;
-            let value_sym = self.value_interner.get_or_intern(value);
-
-            entry_cache_values = match entry_cache_values {
-                Some(values) if entry_cache_key == key => {
-                    values.insert(value_sym);
-                    Some(values)
-                },
-                _ => {
-                    let key_sym = self.key_interner.get_or_intern(key);
-
-                    let values = self.mapping.entry(key_sym).or_default();
-                    values.insert(value_sym);
-
-                    entry_cache_key.replace_range(.., key);
-                    Some(values)
-                }
-            };
-        }
-
-        Ok(())
-    }
-
-    #[apply(Gat!)]
-    pub fn try_add_many_grouped<VS: HKT, E, Iter>(&mut self, mut iter: Iter) -> Result<(), E>
-    where
-        Iter: for<'n> LendingIterator<Item<'n> = Result<(&'n str, Feed<'n, VS>), E>>,
-        for<'n> Feed<'n, VS>: IntoValues<'n, ValueInterner>,
-    {
-        let mut entry_cache_key = String::new();
-        let mut entry_cache_values: Option<&mut HashSet<ValueInterner::Symbol>> = None;
-
-        while let Some(result) = iter.next() {
-            let (key, values) = result?;
-
-            let value_syms = values
-                .into_iter()
-                .map(|value| self.value_interner.get_or_intern(value));
-
-            entry_cache_values = match entry_cache_values {
-                Some(values) if entry_cache_key == key => {
-                    values.extend(value_syms);
-                    Some(values)
-                },
-                _ => {
-                    let key_sym = self.key_interner.get_or_intern(key);
-
-                    let values = self.mapping.entry(key_sym).or_default();
-                    values.extend(value_syms);
-
-                    entry_cache_key.replace_range(.., key);
-                    Some(values)
-                }
-            };
-        }
-
-        Ok(())
-    }
-
-    pub fn lookup_syms(&self, key: &str) -> impl Iterator<Item = ValueInterner::Symbol> + '_ {
         self
             .key_interner
             .get(key)
@@ -210,15 +128,104 @@ where
             .copied()
     }
 
-    pub fn lookup(&self, key: &str) -> impl Iterator<Item = ValueInterner::Value<'_>> + '_ {
+    pub fn lookup<'b, 'a: 'b>(
+        &'a self,
+        key: InternedValue<'b, KeyInterner>,
+    ) -> impl Iterator<Item = InternedValue<'a, ValueInterner>> + 'a {
         self.lookup_syms(key)
             .filter_map(|value_sym| self.value_interner.resolve(value_sym))
     }
+}
 
-    pub fn read_tsv_with<R, F>(reader: R, header: bool, record_parser: F) -> anyhow::Result<Self>
+impl<KeyInterner, ValueInterner> InternedMapping<KeyInterner, ValueInterner>
+where
+    KeyInterner: Interner,
+    ValueInterner: Interner,
+{
+    #[apply(Gat!)]
+    pub fn try_add_many<'a, Iter, E>(&'a mut self, mut iter: Iter) -> Result<(), E>
+    where
+        Iter: for<'n> LendingIterator<
+                Item<'n> = Result<(InternedValue<'n, KeyInterner>, InternedValue<'n, ValueInterner>), E>,
+            > + 'a,
+    {
+        let mut entry_cache_key_sym = None;
+        let mut entry_cache_values: Option<&mut HashSet<ValueInterner::Symbol>> = None;
+
+        while let Some(result) = iter.next() {
+            let (key, value) = result?;
+            let key_sym = self.key_interner.get_or_intern(key);
+            let value_sym = self.value_interner.get_or_intern(value);
+
+            entry_cache_values = match entry_cache_values {
+                Some(values) if entry_cache_key_sym == Some(key_sym) => {
+                    values.insert(value_sym);
+                    Some(values)
+                },
+                _ => {
+                    let values = self.mapping.entry(key_sym).or_default();
+                    values.insert(value_sym);
+
+                    entry_cache_key_sym = Some(key_sym);
+                    Some(values)
+                }
+            };
+        }
+
+        Ok(())
+    }
+
+    #[apply(Gat!)]
+    pub fn try_add_many_grouped<'a, VS: HKT, E, Iter>(&'a mut self, mut iter: Iter) -> Result<(), E>
+    where
+        Iter: for<'n> LendingIterator<Item<'n> = Result<(InternedValue<'n, KeyInterner>, Feed<'n, VS>), E>>
+            + 'a,
+        for<'n> Feed<'n, VS>: IntoValues<'n, ValueInterner>,
+    {
+        let mut entry_cache_key_sym = None;
+        let mut entry_cache_values: Option<&mut HashSet<ValueInterner::Symbol>> = None;
+
+        while let Some(result) = iter.next() {
+            let (key, values) = result?;
+
+            let key_sym = self.key_interner.get_or_intern(key);
+
+            let value_syms = values
+                .into_iter()
+                .map(|value| self.value_interner.get_or_intern(value));
+
+            entry_cache_values = match entry_cache_values {
+                Some(values) if entry_cache_key_sym == Some(key_sym) => {
+                    values.extend(value_syms);
+                    Some(values)
+                },
+                _ => {
+                    let values = self.mapping.entry(key_sym).or_default();
+                    values.extend(value_syms);
+
+                    entry_cache_key_sym = Some(key_sym);
+                    Some(values)
+                }
+            };
+        }
+
+        Ok(())
+    }
+
+    pub fn extend_from_tsv_with<'a, R, F>(
+        &'a mut self,
+        reader: R,
+        header: bool,
+        record_parser: F,
+    ) -> anyhow::Result<()>
     where
         R: io::Read,
-        F: for<'a> Fn(&'a StringRecord) -> anyhow::Result<(&'a str, ValueInterner::Value<'a>)>,
+        F: for<'n> Fn(
+            &'n StringRecord,
+        ) -> anyhow::Result<(
+            InternedValue<'n, KeyInterner>,
+            InternedValue<'n, ValueInterner>,
+        )>,
     {
         let csv_reader = csv::ReaderBuilder::new()
             .comment(Some(b'#'))
@@ -226,15 +233,62 @@ where
             .has_headers(header)
             .from_reader(reader);
 
-        let csv_iter =
-            CsvReaderIter::new(csv_reader)
-                .map::<HKT!(anyhow::Result<(&str, ValueInterner::Value<'_>)>), _>(|[], result| {
+        let csv_iter = CsvReaderIter::new(csv_reader).map::<HKT!(
+            anyhow::Result<(
+                InternedValue<'_, KeyInterner>,
+                InternedValue<'_, ValueInterner>
+            )>
+        ), _>(|[], result| {
                     result.map_err(|e| e.into()).and_then(&record_parser)
                 });
 
+        self.try_add_many(csv_iter)?;
+
+        Ok(())
+    }
+
+    pub fn extend_from_grouped_tsv_with<'a, VS: HKT, R, F>(
+        &'a mut self,
+        reader: R,
+        header: bool,
+        record_parser: F,
+    ) -> anyhow::Result<()>
+    where
+        R: io::Read,
+        F: Fn(&'_ StringRecord) -> anyhow::Result<(InternedValue<'_, KeyInterner>, Feed<'_, VS>)>,
+        for<'n> Feed<'n, VS>: IntoValues<'n, ValueInterner>,
+    {
+        let csv_reader = csv::ReaderBuilder::new()
+            .comment(Some(b'#'))
+            .delimiter(b'\t')
+            .has_headers(header)
+            .from_reader(reader);
+
+        let csv_iter = CsvReaderIter::new(csv_reader).map::<HKT!(
+            anyhow::Result<(InternedValue<'_, KeyInterner>, Feed<'_, VS>)>
+        ), _>(|[], result| {
+            result.map_err(|e| e.into()).and_then(&record_parser)
+        });
+
+        self.try_add_many_grouped(csv_iter)?;
+
+        Ok(())
+    }
+}
+
+impl<KeyInterner, ValueInterner> InternedMapping<KeyInterner, ValueInterner>
+where
+    KeyInterner: Default + Interner<ValueHKT = HKTRef<str>>,
+    ValueInterner: Default + Interner,
+{
+    pub fn read_tsv_with<R, F>(reader: R, header: bool, record_parser: F) -> anyhow::Result<Self>
+    where
+        R: io::Read,
+        F: Fn(&StringRecord) -> anyhow::Result<(&str, InternedValue<'_, ValueInterner>)>,
+    {
         let mut mapping = Self::default();
 
-        mapping.try_add_many(csv_iter)?;
+        mapping.extend_from_tsv_with(reader, header, record_parser)?;
 
         Ok(mapping)
     }
@@ -242,28 +296,23 @@ where
     pub fn read_grouped_tsv_with<VS: HKT, R, F>(reader: R, header: bool, record_parser: F) -> anyhow::Result<Self>
     where
         R: io::Read,
-        F: Fn(&'_ StringRecord) -> anyhow::Result<(&'_ str, Feed<'_, VS>)>,
+        F: Fn(&StringRecord) -> anyhow::Result<(&str, Feed<'_, VS>)>,
         for<'a> Feed<'a, VS>: IntoValues<'a, ValueInterner>,
     {
-        let csv_reader = csv::ReaderBuilder::new()
-            .comment(Some(b'#'))
-            .delimiter(b'\t')
-            .has_headers(header)
-            .from_reader(reader);
-
-        let csv_iter =
-            CsvReaderIter::new(csv_reader)
-                .map::<HKT!(anyhow::Result<(&str, Feed<'_, VS>)>), _>(|[], result| {
-                    result.map_err(|e| e.into()).and_then(&record_parser)
-                });
-
         let mut mapping = Self::default();
 
-        mapping.try_add_many_grouped(csv_iter)?;
+        mapping.extend_from_grouped_tsv_with(reader, header, record_parser)?;
 
         Ok(mapping)
     }
+}
 
+#[apply(Gat!)]
+impl<KeyInterner, ValueInterner> InternedMapping<KeyInterner, ValueInterner>
+where
+    KeyInterner: Resolver,
+    ValueInterner: Resolver,
+{
     pub fn write_tsv_with<W, F>(
         &self,
         writer: W,
@@ -272,7 +321,7 @@ where
     ) -> csv::Result<()>
     where
         W: io::Write,
-        F: for<'a> Fn(&mut csv::Writer<W>, &'a str, ValueInterner::Value<'a>) -> csv::Result<()>,
+        F: for<'a> Fn(&mut csv::Writer<W>, InternedValue<'a, KeyInterner>, InternedValue<'a, ValueInterner>) -> csv::Result<()>,
     {
         let mut csv_writer = csv::WriterBuilder::new()
             .delimiter(b'\t')
@@ -296,16 +345,35 @@ where
     }
 }
 
-
-impl InternedMultiMapping<DefaultStringInterner> {
-    pub fn read_tsv<R: io::Read>(reader: R, header: bool) -> anyhow::Result<Self> {
-        Self::read_tsv_with(reader, header, |record| Ok((&record[0], &record[1])))
+impl<KeyInterner, ValueInterner> InternedMapping<KeyInterner, ValueInterner>
+where
+    KeyInterner: Interner<ValueHKT = HKTRef<str>>,
+    ValueInterner: Interner<ValueHKT = HKTRef<str>>,
+{
+    pub fn extend_from_tsv<R: io::Read>(&mut self, reader: R, header: bool) -> anyhow::Result<()> {
+        self.extend_from_tsv_with(reader, header, |record| Ok((&record[0], &record[1])))
     }
 
     pub fn write_tsv<W: io::Write>(&self, writer: W, header: &[&str]) -> csv::Result<()> {
         self.write_tsv_with(writer, header, |csv_writer, key, value| {
-            csv_writer.write_record(&[key, value])?;
+            csv_writer.write_record([key, value])?;
             Ok(())
         })
+    }
+}
+
+impl<KeyInterner, ValueInterner> InternedMapping<KeyInterner, ValueInterner>
+where
+    KeyInterner: Default,
+    ValueInterner: Default,
+    KeyInterner: for<'a> Interner<ValueHKT = HKTRef<str>>,
+    ValueInterner: for<'a> Interner<ValueHKT = HKTRef<str>>,
+{
+    pub fn read_tsv<R: io::Read>(reader: R, header: bool) -> anyhow::Result<Self> {
+        let mut mapping = Self::default();
+
+        mapping.extend_from_tsv(reader, header)?;
+
+        Ok(mapping)
     }
 }

@@ -1,30 +1,37 @@
-use std::{path::Path, io, marker::PhantomData, collections::HashSet, fs::File};
+use std::{fs::File, io, marker::PhantomData, path::Path};
 
 use clap::Args;
 use itertools::Itertools;
-use lending_iterator::{HKT, LendingIterator};
-use serde::{Serialize, Deserialize};
-use string_interner::DefaultSymbol;
+use lending_iterator::{LendingIterator, HKT};
+use serde::{Deserialize, Serialize};
+use string_interner::{DefaultStringInterner, DefaultSymbol};
 
 use crate::{
+    csv::stream::CsvReaderIterExt,
     fetch::{self, string_viruses::ProteinLinksRecord},
     preprocessed_taxonomy::{with_some_ncbi_or_newick_taxonomy, PreprocessedTaxonomyArgs},
     tango_assign::AssignmentRecord,
     taxonomy::{
         formats::ncbi::NcbiTaxonomy,
-        NodeId, Taxonomy,
+        tree::{
+            node_id::NodeIdSet,
+            walk::{LcaCache, RootedTreeWalk},
+        },
+        NodeId, RootedTree, Taxonomy,
     },
     util::{
-        csv_stream::CsvReaderIterExt,
-        interned_mapping::{InternedMultiMapping, Interner, PairInterner},
-        maybe_gzdecoder, writing_new_file_or_stdout, self,
+        self,
+        interned_mapping::InternedMapping,
+        interners::{PairInterner, Resolver},
+        io::maybe_gzdecoder,
+        writing_new_file_or_stdout,
     },
 };
 
 use super::ProteinVirusTaxidMapping;
 
 struct StringProteinAliases<Entry> {
-    mapping: InternedMultiMapping<PairInterner>,
+    mapping: InternedMapping<DefaultStringInterner, PairInterner>,
     phantom: PhantomData<Entry>,
 }
 
@@ -49,7 +56,7 @@ impl<Entry> StringProteinAliases<Entry> {
 #[allow(dead_code)]
 impl StringProteinAliases<ProteinStringId> {
     pub fn read_tsv<R: io::Read>(reader: R) -> anyhow::Result<Self> {
-        let mapping = InternedMultiMapping::read_grouped_tsv_with::<SourceRepeaterHKT, _, _>(
+        let mapping = InternedMapping::read_grouped_tsv_with::<SourceRepeaterHKT, _, _>(
             reader,
             false,
             |record| {
@@ -120,7 +127,7 @@ impl<'a> Iterator for SourceRepeater<'a> {
 #[allow(dead_code)]
 impl StringProteinAliases<ProteinAlias> {
     pub fn read_tsv<R: io::Read>(reader: R) -> anyhow::Result<Self> {
-        let mapping = InternedMultiMapping::read_grouped_tsv_with::<SourceRepeaterHKT, _, _>(
+        let mapping = InternedMapping::read_grouped_tsv_with::<SourceRepeaterHKT, _, _>(
             reader,
             false,
             |record| {
@@ -232,14 +239,15 @@ pub struct PredictedInteraction<S = String> {
     pub protein_accession_b: S,
     pub combined_score: i32,
     pub virus_name: Option<S>,
-    pub virus_taxid: Option<usize>,
-    pub host_taxid: Option<usize>,
+    pub virus_taxid: Option<u32>,
+    pub host_taxid: Option<u32>,
     pub edge_kind: EdgeKind,
 }
 
 struct PredictionContext<Tax> {
     taxonomy: Tax,
-    assigned_taxids: HashSet<NodeId>,
+    lca_cache: LcaCache,
+    assigned_taxids: NodeIdSet,
     uniprot_virus_mapping: ProteinVirusTaxidMapping,
     string_uniprot_mapping: StringProteinAliases<ProteinAlias>,
     preferred_source_sym: DefaultSymbol,
@@ -262,7 +270,7 @@ impl<Names: 'static> PredictionContext<NcbiTaxonomy<Names>> {
 
         let mut aliases = self.string_uniprot_mapping.find_aliases(string_id);
 
-        let result = if self.assigned_taxids.contains(&taxid) {
+        let result = if self.assigned_taxids.contains(taxid) {
             NodeKind::Host(
                 self.string_uniprot_mapping.resolve_alias_name(
                     aliases
@@ -288,7 +296,7 @@ impl<Names: 'static> PredictionContext<NcbiTaxonomy<Names>> {
                         };
 
                         if self.taxonomy.are_independent(taxid, hit_taxid) {
-                            match self.taxonomy.lca(taxid, hit_taxid).and_then(|lca| self.taxonomy.find_rank_str(lca)) {
+                            match self.lca_cache.lca_node(taxid, hit_taxid).ok().and_then(|lca| self.taxonomy.find_rank_str(lca)) {
                                 Some("genus") => {
                                 },
                                 r => {
@@ -349,7 +357,7 @@ impl<Names: 'static> PredictionContext<NcbiTaxonomy<Names>> {
                         combined_score: record.combined_score,
                         virus_name: None,
                         virus_taxid: None,
-                        host_taxid: Some(taxid_a.0),
+                        host_taxid: Some(taxid_a.into()),
                         edge_kind: HostHost,
                     })
                 }
@@ -411,15 +419,15 @@ fn read_assignment_taxids<Tax: Taxonomy>(
     assignment: &Path,
     taxonomy: &Tax,
     include_descendants: bool,
-) -> anyhow::Result<HashSet<NodeId>> {
-    let mut taxids = HashSet::new();
+) -> anyhow::Result<NodeIdSet> {
+    let mut taxids = NodeIdSet::new();
 
     let mut csv_reader_iter = csv::ReaderBuilder::new()
         .delimiter(b'\t')
         .has_headers(true)
         .from_path(assignment)?
         .into_lending_iter()
-        .into_deserialize::<HKT!(AssignmentRecord<&str>)>(None);
+        .into_deserialize::<HKT!(AssignmentRecord<'_>)>(None);
 
     while let Some(record) = csv_reader_iter.next() {
         let taxid = NodeId(record?.assigned_taxid);
@@ -462,6 +470,8 @@ pub fn string_viruses_interactions(args: StringVirusesInteractionsArgs) -> anyho
             },
         );
 
+        let lca_cache = LcaCache::compute(&taxonomy);
+
         eprintln!("Reading the metagenomic assignment from {}", &args.metagenomic_assignment);
         let assigned_taxids = read_assignment_taxids(
             args.metagenomic_assignment.as_ref(),
@@ -489,6 +499,7 @@ pub fn string_viruses_interactions(args: StringVirusesInteractionsArgs) -> anyho
 
         PredictionContext {
             taxonomy,
+            lca_cache,
             assigned_taxids,
             uniprot_virus_mapping,
             string_uniprot_mapping,
@@ -535,7 +546,7 @@ pub fn string_viruses_interactions(args: StringVirusesInteractionsArgs) -> anyho
 
                 for interaction in receiver {
                     if let Err(e) = csv_writer.serialize(interaction) {
-                        if util::is_broken_pipe(&e) {
+                        if util::io::is_broken_pipe(&e) {
                             break;
                         } else {
                             return Err(e.into());

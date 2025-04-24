@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::taxonomy::generic::TaxonomyBuildError;
+use crate::taxonomy::unlabeled_intmap::TaxonomyBuildError;
 use std::{io, num::ParseIntError};
 
 #[derive(Debug, Error)]

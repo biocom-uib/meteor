@@ -1,1 +1,1 @@
-docker run -v $PWD:/volume --rm -t clux/muslrust:nightly cargo build --release
+podman run -v "$PWD:/volume" --rm -t -w /volume docker.io/clux/muslrust cargo build --release

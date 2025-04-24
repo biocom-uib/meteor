@@ -6,7 +6,7 @@ use regex::Regex;
 use serde::Deserialize;
 use tempdir::TempDir;
 
-use crate::util::{cli_tools::{self, CliTool}, interned_mapping::InternedMultiMapping, writing_new_file_or_stdout, self};
+use crate::util::{cli_tools::{self, CliTool}, interned_mapping::InternedMapping, writing_new_file_or_stdout, self};
 
 use super::ProteinVirusTaxidMapping;
 
@@ -25,7 +25,7 @@ const BLASTOUT_FILE_NAME: &str = "uniprot_viral_search.blastout";
 struct ProteinProteinTaxidRecord<S = String> {
     predicted_name: S,
     uniprot_accession: S,
-    taxid: usize,
+    taxid: u32,
 }
 
 pub struct ProdigalBlastpPipeline {
@@ -150,7 +150,7 @@ impl ProdigalBlastpPipeline {
 
         let file_reader = File::open(self.work_dir.join(BLASTOUT_FILE_NAME))?;
 
-        let mapping = InternedMultiMapping::read_tsv_with(file_reader, false, |record| {
+        let mapping = InternedMapping::read_tsv_with(file_reader, false, |record| {
             let record = record.deserialize::<ProteinProteinTaxidRecord<&str>>(None)?;
 
             if let Some(suffix_match) = protein_virus_name_regex.find(record.predicted_name) {

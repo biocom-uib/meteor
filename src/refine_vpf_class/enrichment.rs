@@ -4,25 +4,22 @@ use itertools::Itertools;
 use serde::{ser::SerializeStruct, Serialize, Serializer};
 
 use crate::{
-    crispr_match::CrisprMatchData,
-    taxonomy::NodeId,
-    util::csv_flatten_fix::{serialize_flat_struct, SerializeFlat},
-    tool::vpf_class::VpfClassRecord,
+    crispr_match::VirusHostMapping, csv::flatten_fix::{serialize_flat_struct, SerializeFlat}, taxonomy::tree::node_id::NodeIdSet, tool::vpf_class::VpfClassRecord
 };
 
-pub trait Enrichment: Default {
-    type Context;
+pub trait Enrichment<'a>: Default {
+    type Context: Copy;
     type CsvFields: SerializeFlat + From<Self>;
 
     type SummaryClassData: Default + Clone;
     type SummaryClassStats: SerializeFlat + From<Self::SummaryClassData>;
 
-    fn enrich<S: AsRef<str>>(
+    fn enrich<'r>(
         &mut self,
-        context: &Self::Context,
-        vpf_class_record: &VpfClassRecord<S>,
-        assigned_taxids: &HashSet<NodeId>,
-        assigned_contigs: &HashSet<&str>,
+        context: Self::Context,
+        vpf_class_record: &VpfClassRecord<'r>,
+        assigned_taxids: &NodeIdSet,
+        assigned_contigs: &HashSet<&'a str>,
     ) -> bool;
 
     fn add_class_data(&self, class_data: &mut Self::SummaryClassData);
@@ -32,6 +29,7 @@ pub trait Enrichment: Default {
     }
 }
 
+#[derive(Copy, Clone)]
 pub struct NoEnrichmentContext;
 
 #[derive(Default, Clone)]
@@ -56,19 +54,19 @@ impl SerializeFlat for NoEnrichment {
     }
 }
 
-impl Enrichment for NoEnrichment {
+impl<'a> Enrichment<'a> for NoEnrichment {
     type Context = NoEnrichmentContext;
     type CsvFields = NoEnrichment;
     type SummaryClassData = NoEnrichmentData;
     type SummaryClassStats = NoEnrichmentData;
 
     #[must_use]
-    fn enrich<S: AsRef<str>>(
+    fn enrich<'r>(
         &mut self,
-        _context: &Self::Context,
-        _vpf_class_record: &VpfClassRecord<S>,
-        _assigned_taxids: &HashSet<NodeId>,
-        _assigned_contigs: &HashSet<&str>,
+        _context: Self::Context,
+        _vpf_class_record: &VpfClassRecord<'r>,
+        _assigned_taxids: &NodeIdSet,
+        _assigned_contigs: &HashSet<&'a str>,
     ) -> bool {
         true
     }
@@ -128,19 +126,19 @@ impl SerializeFlat for CrisprEnrichmentSummaryClassStats {
     }
 }
 
-impl<'a> Enrichment for CrisprEnrichment<'a> {
-    type Context = &'a CrisprMatchData;
+impl<'a> Enrichment<'a> for CrisprEnrichment<'a> {
+    type Context = &'a VirusHostMapping;
     type CsvFields = CrisprMatchesCsvFields;
 
-    fn enrich<S: AsRef<str>>(
+    fn enrich<'r>(
         &mut self,
-        context: &&'a CrisprMatchData,
-        vpf_class_record: &VpfClassRecord<S>,
-        _assigned_taxids: &HashSet<NodeId>,
-        assigned_contigs: &HashSet<&str>,
+        context: &'a VirusHostMapping,
+        vpf_class_record: &VpfClassRecord<'r>,
+        _assigned_taxids: &NodeIdSet,
+        assigned_contigs: &HashSet<&'a str>,
     ) -> bool {
         self.crispr_matches.extend(
-            context.crispr_matches
+            context
                 .0
                 .lookup(vpf_class_record.virus_name.as_ref())
                 .filter(|contig| assigned_contigs.contains(contig))
@@ -158,18 +156,18 @@ impl<'a> Enrichment for CrisprEnrichment<'a> {
 }
 
 
-pub struct EnrichedVpfClassRecord<'a, S, CE> {
-    pub vpf_class_record: VpfClassRecord<S>,
-    pub assigned_taxids: HashSet<NodeId>,
+pub struct EnrichedVpfClassRecord<'a, 'r, CE> {
+    pub vpf_class_record: VpfClassRecord<'r>,
+    pub assigned_taxids: NodeIdSet,
     pub assigned_contigs: HashSet<&'a str>,
     pub crispr_enrichment: CE,
 }
 
-impl<'a, S, CE: Default> EnrichedVpfClassRecord<'a, S, CE> {
-    pub fn new(vpf_class_record: VpfClassRecord<S>) -> Self {
+impl<'a, 'r, CE: Default> EnrichedVpfClassRecord<'a, 'r, CE> {
+    pub fn new(vpf_class_record: VpfClassRecord<'r>) -> Self {
         EnrichedVpfClassRecord {
             vpf_class_record,
-            assigned_taxids: HashSet::new(),
+            assigned_taxids: NodeIdSet::new(),
             assigned_contigs: HashSet::new(),
             crispr_enrichment: CE::default(),
         }
@@ -181,8 +179,8 @@ impl<'a, S, CE: Default> EnrichedVpfClassRecord<'a, S, CE> {
 }
 
 #[derive(Debug)]
-pub struct CsvEnrichedVpfClassRecord<S, CE: Enrichment> {
-    pub vpf_class_record: VpfClassRecord<S>,
+pub struct CsvEnrichedVpfClassRecord<'a, 'r, CE: Enrichment<'a>> {
+    pub vpf_class_record: VpfClassRecord<'r>,
 
     pub assigned_taxids: String,
     pub num_assigned_contigs: usize,
@@ -190,18 +188,20 @@ pub struct CsvEnrichedVpfClassRecord<S, CE: Enrichment> {
     pub crispr_match_fields: CE::CsvFields,
 }
 
-impl<S: AsRef<str>, CE: Enrichment> Serialize for CsvEnrichedVpfClassRecord<S, CE> {
+impl<'a, 'r, CE> Serialize for CsvEnrichedVpfClassRecord<'a, 'r, CE>
+where
+    CE: Enrichment<'a>,
+{
     fn serialize<Ser: Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
         serialize_flat_struct(serializer, "CsvEnrichedVpfClassRecord", self)
     }
 }
 
-impl<S, CE> SerializeFlat for CsvEnrichedVpfClassRecord<S, CE>
+impl<'a, 'r, CE> SerializeFlat for CsvEnrichedVpfClassRecord<'a, 'r, CE>
 where
-    S: AsRef<str>,
-    CE: Enrichment,
+    CE: Enrichment<'a>,
 {
-    const FIELD_COUNT: usize = VpfClassRecord::<S>::FIELD_COUNT + 2 + CE::CsvFields::FIELD_COUNT;
+    const FIELD_COUNT: usize = VpfClassRecord::FIELD_COUNT + 2 + CE::CsvFields::FIELD_COUNT;
 
     fn serialize_flat<Ser: SerializeStruct>(&self, row: &mut Ser) -> Result<(), Ser::Error> {
         self.vpf_class_record.serialize_flat(row)?;
@@ -215,11 +215,11 @@ where
     }
 }
 
-impl<'a, S, CE> From<EnrichedVpfClassRecord<'a, S, CE>> for CsvEnrichedVpfClassRecord<S, CE>
+impl<'a, 'r, CE> From<EnrichedVpfClassRecord<'a, 'r, CE>> for CsvEnrichedVpfClassRecord<'a, 'r, CE>
 where
-    CE: Enrichment,
+    CE: Enrichment<'a>,
 {
-    fn from(other: EnrichedVpfClassRecord<'a, S, CE>) -> Self {
+    fn from(other: EnrichedVpfClassRecord<'a, 'r, CE>) -> Self {
         CsvEnrichedVpfClassRecord {
             vpf_class_record: other.vpf_class_record,
             assigned_taxids: other.assigned_taxids.iter().join(";"),

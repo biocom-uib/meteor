@@ -1,126 +1,38 @@
-use std::{
-    collections::HashMap,
-    error::Error,
-    fs::File,
-    io::{self, Read, Write},
-    iter,
-    path::Path,
-    slice,
-    string::FromUtf8Error,
-};
+use std::{fs::File, path::Path};
 
 use itertools::Itertools;
-use newick_rs::{newick, SimpleTree};
+use newick_rs::SimpleTree;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
-use crate::taxonomy::{LabelledTaxonomy, NodeId, Taxonomy};
+use crate::taxonomy::{
+    labels::vec::{RootedVecTreeLabels, RootedVecTreeRanks},
+    tree::{
+        newick::{read_newick_simple_tree, NewickLoadError},
+        vec::RootedVecTree,
+        RootedTree,
+    },
+    LabeledTaxonomy, NodeId, Taxonomy,
+};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NewickTaxonomy {
-    pub root: NodeId,
-
-    pub parent_ids: Vec<NodeId>,
-    children_lookup: Vec<Vec<NodeId>>,
-
-    pub labels: Vec<String>,
-    label_lookup: HashMap<String, Vec<NodeId>>,
-
-    depths: Vec<usize>,
-    rank_storage: Vec<String>,
+    pub tree: RootedVecTree,
+    pub labels: RootedVecTreeLabels,
+    pub ranks: RootedVecTreeRanks,
 }
-
-#[derive(Debug, Error)]
-pub enum NewickLoadError {
-    #[error("IO error loading newick")]
-    IoError(#[from] io::Error),
-
-    #[error("Encoding error of newick data")]
-    EncodingError(#[from] FromUtf8Error),
-
-    #[error("Newick parse error: {}", .0)]
-    ParseError(#[source] Box<dyn Error + Send + Sync>),
-}
-
-// This module assumes that we can address 64 bits
-const _: () = assert!(std::mem::size_of::<usize>() == std::mem::size_of::<u64>());
 
 impl NewickTaxonomy {
-    pub const FORMAT_VERSION: u32 = 0;
+    pub const FORMAT_VERSION: u32 = 1;
 
     pub fn from_simple_tree(value: SimpleTree, ranks: Vec<String>) -> Self {
-        let rank_storage = ranks;
+        let (tree, labels, depths) = RootedVecTree::from_simple_tree(value);
 
-        let mut label_lookup = HashMap::new();
-        let mut labels = Vec::new();
-
-        let mut depths = Vec::new();
-
-        let mut new_node = |label: String, depth: usize| {
-            let node_id = NodeId(labels.len() as u64);
-
-            labels.push(label.clone());
-
-            label_lookup
-                .entry(label)
-                .or_insert_with(Vec::new)
-                .push(node_id);
-
-            depths.push(depth);
-
-            assert!(depth < rank_storage.len());
-
-            node_id
-        };
-
-        struct StackFrame {
-            node_id: NodeId,
-            children: Vec<NodeId>,
-            orig_children_iter: std::vec::IntoIter<SimpleTree>,
-        }
-
-        impl StackFrame {
-            fn new(node_id: NodeId, orig_children: Vec<SimpleTree>) -> Self {
-                StackFrame {
-                    node_id,
-                    children: Vec::new(),
-                    orig_children_iter: orig_children.into_iter(),
-                }
-            }
-        }
-
-        let root = new_node(value.name, 0);
-        let mut stack = vec![StackFrame::new(root, value.children)];
-
-        let mut parent_ids = vec![root];
-        let mut children_lookup = vec![vec![]];
-
-        while let (depth, Some(frame)) = (stack.len(), stack.last_mut()) {
-            if let Some(child) = frame.orig_children_iter.next() {
-                let child_id = new_node(child.name, depth);
-
-                assert!(parent_ids.len() as u64 == child_id.0);
-                parent_ids.push(frame.node_id);
-                frame.children.push(child_id);
-
-                assert!(children_lookup.len() as u64 == child_id.0);
-                children_lookup.push(vec![]);
-
-                stack.push(StackFrame::new(child_id, child.children));
-            } else {
-                let popped = stack.pop().unwrap();
-                children_lookup[popped.node_id.0 as usize] = popped.children;
-            }
-        }
+        let ranks = RootedVecTreeRanks::new(depths, ranks);
 
         NewickTaxonomy {
-            root,
-            parent_ids,
-            children_lookup,
+            tree,
             labels,
-            label_lookup,
-            depths,
-            rank_storage,
+            ranks,
         }
     }
 
@@ -133,41 +45,53 @@ impl NewickTaxonomy {
         Ok(Self::from_simple_tree(simple_tree, ranks))
     }
 
-    pub fn has_node(&self, node: u64) -> bool {
-        node < self.parent_ids.len() as u64
+    pub fn has_node(&self, node: u32) -> bool {
+        self.tree.has_node(node)
     }
 
-    pub fn all_nodes(&self) -> impl Iterator<Item = NodeId> {
-        (0..self.parent_ids.len()).map(|id| NodeId(id as u64))
+    pub fn nodes(&self) -> impl Iterator<Item = NodeId> {
+        self.tree.nodes()
+    }
+
+    pub fn relabel(&mut self, f: impl Fn(NodeId, &str, &Self) -> String) {
+        self.labels = self
+            .labels
+            .iter()
+            .map(|(node, label)| (node, f(node, label, self)))
+            .collect();
+    }
+}
+
+impl RootedTree for NewickTaxonomy {
+    fn get_root(&self) -> NodeId {
+        self.tree.get_root()
+    }
+
+    fn fixup_node(&self, node: u32) -> Option<NodeId> {
+        self.tree.fixup_node(node)
+    }
+
+    fn node_count(&self) -> usize {
+        self.tree.node_count()
+    }
+
+    fn find_parent(&self, node: NodeId) -> Option<NodeId> {
+        self.tree.find_parent(node)
+    }
+
+    type Children<'a> = <RootedVecTree as RootedTree>::Children<'a>;
+
+    fn iter_children(&self, node: NodeId) -> Self::Children<'_> {
+        self.tree.iter_children(node)
     }
 }
 
 impl Taxonomy for NewickTaxonomy {
-    fn get_root(&self) -> NodeId {
-        self.root
-    }
-
-    fn fixup_node(&self, node: u64) -> Option<NodeId> {
-        if self.has_node(node) {
-            Some(NodeId(node))
-        } else {
-            None
-        }
-    }
-
-    fn find_parent(&self, node: NodeId) -> Option<NodeId> {
-        if node == self.root {
-            None
-        } else {
-            self.parent_ids.get(node.0 as usize).copied()
-        }
-    }
-
     fn has_uniform_depths(&self) -> Option<usize> {
         let mut depths = self
-            .all_nodes()
+            .nodes()
             .filter(|&node| self.is_leaf(node))
-            .map(|node| self.depths[node.0 as usize])
+            .filter_map(|node| self.ranks.depths().get(node))
             .peekable();
 
         let &depth = depths.peek().expect("Tree has no leaves");
@@ -179,238 +103,230 @@ impl Taxonomy for NewickTaxonomy {
         }
     }
 
-    type Children<'a> = std::iter::Copied<std::slice::Iter<'a, NodeId>>;
-
-    fn iter_children(&self, node: NodeId) -> Self::Children<'_> {
-        self.children_lookup[node.0 as usize].iter().copied()
-    }
-
     type RankSym = usize;
 
     fn rank_sym_str(&self, rank_sym: Self::RankSym) -> Option<&str> {
-        self.rank_storage.get(rank_sym).map(|s| &**s)
+        self.ranks.rank_sym_str(rank_sym)
     }
 
     fn lookup_rank_sym(&self, rank: &str) -> Option<Self::RankSym> {
-        self.rank_storage.iter().position(|r| r == rank)
+        self.ranks.lookup_rank_sym(rank)
     }
 
     fn find_rank(&self, node: NodeId) -> Option<Self::RankSym> {
-        self.depths.get(node.0 as usize).copied()
+        self.ranks.find_rank(node)
     }
 
-    type NodeRanks<'a> = EnumerateAsNodeId<iter::Copied<slice::Iter<'a, Self::RankSym>>>;
+    type NodeRanks<'a> = impl Iterator<Item = (NodeId, Self::RankSym)>;
 
     fn node_ranks(&self) -> Self::NodeRanks<'_> {
-        EnumerateAsNodeId {
-            inner: self.depths.iter().copied().enumerate(),
-        }
+        self.ranks.node_ranks()
     }
 }
 
-impl LabelledTaxonomy for NewickTaxonomy {
+impl LabeledTaxonomy for NewickTaxonomy {
     type Labels<'a> = std::option::IntoIter<&'a str>;
 
     fn labels_of(&self, node: NodeId) -> Self::Labels<'_> {
-        self.labels.get(node.0 as usize).map(String::as_str).into_iter()
+        self.labels.get(node).into_iter()
     }
 
-    type NodesWithLabel<'a> =
-        std::iter::Copied<std::iter::Flatten<std::option::IntoIter<&'a Vec<NodeId>>>>;
+    type NodesWithLabel<'a> = impl Iterator<Item = NodeId> + 'a;
 
-    fn nodes_with_label<'a>(&'a self, label: &'a str) -> Self::NodesWithLabel<'a> {
-        self.label_lookup.get(label).into_iter().flatten().copied()
-    }
-}
-
-pub struct EnumerateAsNodeId<I> {
-    inner: iter::Enumerate<I>,
-}
-
-impl<I: Iterator> Iterator for EnumerateAsNodeId<I> {
-    type Item = (NodeId, <I as Iterator>::Item);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let (i, x) = self.inner.next()?;
-
-        Some((NodeId(i as u64), x))
-    }
-}
-
-pub fn read_newick_simple_tree<R: Read>(mut reader: R) -> Result<SimpleTree, NewickLoadError> {
-    let contents = io::read_to_string(&mut reader)?;
-
-    let tree: SimpleTree = newick::from_newick(&contents)
-        .map_err(|err| NewickLoadError::ParseError(Box::new(err.to_owned())))?;
-
-    Ok(tree)
-}
-
-pub fn write_newick_simple_tree<W: Write>(
-    tree: &SimpleTree,
-    mut writer: W,
-) -> Result<(), io::Error> {
-    writer.write_all(newick::to_newick(tree).as_bytes())
-}
-
-fn make_simple_tree(
-    node_id: NodeId,
-    children_lookup: &mut Vec<Vec<NodeId>>,
-    labels: &mut Vec<String>,
-) -> SimpleTree {
-    let children = std::mem::take(&mut children_lookup[node_id.0 as usize])
-        .into_iter()
-        .map(|child_id| make_simple_tree(child_id, children_lookup, labels))
-        .collect();
-
-    SimpleTree {
-        name: std::mem::take(&mut labels[node_id.0 as usize]),
-        children,
-        length: None,
+    fn nodes_with_label<'a>(&self, label: &str) -> Self::NodesWithLabel<'_> {
+        self.labels.nodes_with_label(label)
     }
 }
 
 impl From<NewickTaxonomy> for SimpleTree {
     fn from(taxonomy: NewickTaxonomy) -> Self {
-        let root = taxonomy.root;
-        let mut children_lookup = taxonomy.children_lookup;
-        let mut labels = taxonomy.labels;
-
-        make_simple_tree(root, &mut children_lookup, &mut labels)
+        taxonomy.tree.into_simple_tree(taxonomy.labels)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use itertools::Itertools;
-    use newick_rs::SimpleTree;
 
-    use crate::taxonomy::{formats::newick::NewickTaxonomy, LabelledTaxonomy, Taxonomy};
+    use crate::taxonomy::{
+        formats::newick::NewickTaxonomy, tree::newick::newick_literal, LabeledTaxonomy, Taxonomy
+    };
 
-    macro_rules! newick_literal {
-        ([ $($trees:tt),+ ] $name:expr) => {
-            SimpleTree {
-                name: $name.to_string(),
-                children: vec![ $( newick_literal!($trees) ),+ ],
-                length: None
-            }
-        };
-
-        (($sub:ident)) => {
-            $sub
-        };
-
-        ($name:expr) => {
-            SimpleTree {
-                name: $name.to_string(),
-                children: vec![],
-                length: None
-            }
-        };
+    pub fn sample_ranks() -> Vec<String> {
+        vec![
+            "root".to_owned(),
+            "superkingdom".to_owned(),
+            "phylum".to_owned(),
+            "class".to_owned(),
+            "order".to_owned(),
+            "family".to_owned(),
+            "genus".to_owned(),
+            "species".to_owned(),
+        ]
     }
 
-    #[test]
-    fn ancestors() {
-        fn chain(n: u32) -> SimpleTree {
-            if n == 0 {
-                newick_literal!(0u32)
-            } else {
-                let sub = chain(n - 1);
-                newick_literal!( [ (sub) ] n )
+    fn rank_labeled_taxonomy(mut tax: NewickTaxonomy) -> NewickTaxonomy {
+        tax.relabel(|node, label, tax| {
+            let prefix = match tax.find_rank_str(node).unwrap_or("") {
+                "root" => "R",
+                "" => "?",
+                "superkingdom" => "S",
+                rank => &rank[0..1],
+            };
+
+            format!("{prefix}{label}")
+        });
+
+        tax
+    }
+
+    pub fn sample_taxonomy() -> NewickTaxonomy {
+        //                              R0                           root
+        //                              S1                           superkingdom
+        //                              p2                           phylum
+        //                              /\
+        //                           /      \
+        //                        /            \
+        //                     /                  \
+        //                  /                        \
+        //               c3                           c20            class
+        //                |                            /\
+        //                |                          /    \
+        //                |                        /        \
+        //               o4                     o21         o29      order
+        //               / \                     |           |
+        //             /     \                   |           |
+        //           /         \                 |           |
+        //         /             \               |           |
+        //       f5             f13             f22         f30      family
+        //      /  \            /  \            /  \         |
+        //     /    \          /    \          /    \        |
+        //   g6     g10     g14     g17     g23     g26     g31      genus
+        //   /|\    /  \    /  \    /  \    /  \    /  \    /  \
+        // s7s8s9 s11 s12 s15 s16 s18 s19 s24 s25 s27 s28 s32 s33    species
+
+        let genera = [
+            newick_literal! { [7, 8, 9] 6 },
+            newick_literal! { [11, 12]  10 },
+            newick_literal! { [15, 16]  14 },
+            newick_literal! { [18, 19]  17 },
+            newick_literal! { [24, 25]  23 },
+            newick_literal! { [27, 28]  26 },
+            newick_literal! { [32, 33]  31 },
+        ];
+
+        let families = [
+            newick_literal! { [ (genera[0].clone()), (genera[1].clone()) ]  5 },
+            newick_literal! { [ (genera[2].clone()), (genera[3].clone()) ] 13 },
+            newick_literal! { [ (genera[4].clone()), (genera[5].clone()) ] 22 },
+            newick_literal! { [ (genera[6].clone()) ] 30 },
+        ];
+
+        let orders = [
+            newick_literal! { [ (families[0].clone()), (families[1].clone()) ] 4 },
+            newick_literal! { [ (families[2].clone()) ] 21 },
+            newick_literal! { [ (families[3].clone()) ] 29 },
+        ];
+
+        let classes = [
+            newick_literal! { [ (orders[0].clone()) ] 3 },
+            newick_literal! { [ (orders[1].clone()), (orders[2].clone()) ] 20 },
+        ];
+
+        let phylums = [newick_literal! { [ (classes[0].clone()), (classes[1].clone()) ] 2 }];
+
+        let superkingdoms = [newick_literal! { [ (phylums[0].clone()) ] 1 }];
+
+        let root = newick_literal! { [ (superkingdoms[0].clone()) ] 0 };
+
+        rank_labeled_taxonomy(NewickTaxonomy::from_simple_tree(root, sample_ranks()))
+    }
+
+    pub fn verify_node_ids_equal_labels(tax: &NewickTaxonomy) -> bool {
+        for node in tax.nodes() {
+            let labels = tax
+                .labels_of(node)
+                .map(|label| {
+                    if label.chars().next().is_some_and(|x| !x.is_ascii_digit()) {
+                        &label[1..]
+                    } else {
+                        label
+                    }
+                })
+                .collect_vec();
+
+            if labels != [&node.0.to_string()] {
+                return false
             }
         }
 
-        let simple_t = chain(5);
-
-        let ranks = "a,b,c,d,e,f".split(',').map(|s| s.to_owned()).collect_vec();
-
-        let t = NewickTaxonomy::from_simple_tree(simple_t, ranks);
-
-        assert_eq!(
-            t.ancestors(t.nodes_with_label("0").next().unwrap())
-                .map(|node| t.labels_of(node).next().unwrap())
-                .collect_vec(),
-            vec!["1", "2", "3", "4", "5"]
-        );
+        true
     }
 
     #[test]
-    fn postorder_descendants() {
-        let sub = newick_literal! { [1i32, 2i32] 3i32 };
-        let simple_t = newick_literal! { [ 0i32, (sub) ] 4i32 };
-
-        let ranks = "a,b,c".split(',').map(|s| s.to_owned()).collect_vec();
-
-        let t = NewickTaxonomy::from_simple_tree(simple_t, ranks);
-
-        eprintln!("{t:?}");
-
-        assert_eq!(
-            t.postorder_descendants(t.get_root())
-                .map(|node| t.some_label_of(node).unwrap())
-                .collect_vec(),
-            vec!["0", "1", "2", "3", "4"]
-        );
+    pub fn verify_sample_taxonomy() {
+        assert!(verify_node_ids_equal_labels(&sample_taxonomy()));
     }
 
-    #[test]
-    fn preorder_edges() {
-        let sub = newick_literal! { [1i32, 2i32] 3i32 };
-        let simple_t = newick_literal! { [ 0i32, (sub) ] 4i32 };
+    pub fn ambiguous_taxonomy() -> NewickTaxonomy {
+        //                              0                           root
+        //                              1                           superkingdom
+        //                              2                           phylum
+        //                             /\
+        //                          /      \
+        //                       /            \
+        //                    /                  \
+        //                 /                        \
+        //               3                            20            class
+        //               |                            /\
+        //               |                          /    \
+        //               |                        /        \
+        //               4                      21          29      order
+        //              / \                     |           |
+        //            /     \                   |           |
+        //          /         \                 |           |
+        //        /             \               |           |
+        //       x              13              22          30      family
+        //     /  \            /  \            /  \         |
+        //    /    \          /    \          /    \        |
+        //   x      10      14      17      23      26      31      genus
+        //  /|\    /  \    /  \    /  \    /  \    /  \    /  \
+        // 7 8 9  11  12  15  16  18  19  24  25  27  28  32  33    species
 
-        let ranks = "a,b,c".split(',').map(|s| s.to_owned()).collect_vec();
+        let genera = [
+            newick_literal! { [7, 8, 9] "x" },
+            newick_literal! { [11, 12]  10 },
+            newick_literal! { [15, 16]  14 },
+            newick_literal! { [18, 19]  17 },
+            newick_literal! { [24, 25]  23 },
+            newick_literal! { [27, 28]  26 },
+            newick_literal! { [32, 33]  31 },
+        ];
 
-        let t = NewickTaxonomy::from_simple_tree(simple_t, ranks);
+        let families = [
+            newick_literal! { [ (genera[0].clone()), (genera[1].clone()) ] "x" },
+            newick_literal! { [ (genera[2].clone()), (genera[3].clone()) ] 13 },
+            newick_literal! { [ (genera[4].clone()), (genera[5].clone()) ] 22 },
+            newick_literal! { [ (genera[6].clone()) ] 30 },
+        ];
 
-        assert_eq!(
-            t.preorder_edges(t.get_root())
-                .map(|(_parent, node)| t.some_label_of(node).unwrap())
-                .collect_vec(),
-            vec!["0", "3", "1", "2"]
-        );
-    }
+        let orders = [
+            newick_literal! { [ (families[0].clone()), (families[1].clone()) ] 4 },
+            newick_literal! { [ (families[2].clone()) ] 21 },
+            newick_literal! { [ (families[3].clone()) ] 29 },
+        ];
 
-    #[test]
-    fn lca() {
-        let sub = newick_literal! { [1i32, 2i32] 3i32 };
-        let simple_t = newick_literal! { [ 0i32, (sub) ] 4i32 };
+        let classes = [
+            newick_literal! { [ (orders[0].clone()) ] 3 },
+            newick_literal! { [ (orders[1].clone()), (orders[2].clone()) ] 20 },
+        ];
 
-        // [0, [1, 2] 3] 4
+        let phylums = [newick_literal! { [ (classes[0].clone()), (classes[1].clone()) ] 2 }];
 
-        let ranks = "a,b,c".split(',').map(|s| s.to_owned()).collect_vec();
+        let superkingdoms = [newick_literal! { [ (phylums[0].clone()) ] 1 }];
 
-        let t = NewickTaxonomy::from_simple_tree(simple_t, ranks);
+        let root = newick_literal! { [ (superkingdoms[0].clone()) ] 0 };
 
-        assert_eq!(
-            t.lca(
-                t.some_node_with_label("1").unwrap(),
-                t.some_node_with_label("2").unwrap(),
-            ),
-            Some(t.some_node_with_label("3").unwrap()),
-        );
-
-        assert_eq!(
-            t.lca(
-                t.some_node_with_label("0").unwrap(),
-                t.some_node_with_label("1").unwrap(),
-            ),
-            Some(t.some_node_with_label("4").unwrap()),
-        );
-
-        assert_eq!(
-            t.lca(
-                t.some_node_with_label("1").unwrap(),
-                t.some_node_with_label("3").unwrap(),
-            ),
-            Some(t.some_node_with_label("3").unwrap()),
-        );
-
-        assert_eq!(
-            t.lca(
-                t.some_node_with_label("1").unwrap(),
-                t.some_node_with_label("1").unwrap(),
-            ),
-            Some(t.some_node_with_label("1").unwrap()),
-        );
+        NewickTaxonomy::from_simple_tree(root, sample_ranks())
     }
 }

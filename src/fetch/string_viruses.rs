@@ -9,7 +9,7 @@ use clap::{Args, ValueEnum};
 use flate2::read::GzDecoder;
 use serde::{Serialize, Deserialize};
 
-use crate::util::{progress_monitor, MaybeGzDecoder};
+use crate::util::{progress_monitor, io::MaybeGzDecoder};
 
 // viruses.string-db.org does not support https (23/03/2023)
 const STRING_VIRUSES_BASE_URL: &str = "http://viruses.string-db.org/download";
@@ -74,7 +74,7 @@ impl FileName {
     }
 }
 
-pub fn parse_string_id(string_id: &str) -> Option<(usize, &str)> {
+pub fn parse_string_id(string_id: &str) -> Option<(u32, &str)> {
     let (taxid, name) = string_id.split_once('.')?;
 
     Some((taxid.parse().ok()?, name))
