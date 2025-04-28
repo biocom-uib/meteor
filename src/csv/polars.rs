@@ -9,7 +9,7 @@ use polars::{
     error::PolarsResult,
     lazy::dsl::Expr,
     prelude::{
-        arity::{binary_elementwise, unary_elementwise}, ChunkedCollectIterExt, IntoColumn, JoinBuilder, JoinCoalesce, JoinType, JoinValidation, LazyCsvReader, LazyFileListReader, LazyFrame, Schema
+        arity::unary_elementwise, ChunkedCollectIterExt, IntoColumn, JoinBuilder, JoinCoalesce, JoinType, JoinValidation, LazyCsvReader, LazyFileListReader, LazyFrame, Schema
     },
     series::{IntoSeries, Series},
 };

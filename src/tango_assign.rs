@@ -37,10 +37,6 @@ pub struct TaxonMatchCount {
 }
 
 impl TaxonMatchCount {
-    pub fn new() -> Self {
-        Default::default()
-    }
-
     pub fn clear_matches(&mut self) {
         self.matches = 0;
     }

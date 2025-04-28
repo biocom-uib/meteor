@@ -25,14 +25,7 @@ use crate::{
 
 mod metagenomic_matches;
 
-#[cfg(feature = "refine_host_prediction_polars")]
-mod polars_impl;
-#[cfg(feature = "refine_host_prediction_polars")]
-use polars_impl::refine_host_prediction_with_tax_impl;
-
-#[cfg(not(feature = "refine_host_prediction_polars"))]
 mod csv_impl;
-#[cfg(not(feature = "refine_host_prediction_polars"))]
 use csv_impl::refine_host_prediction_with_tax_impl;
 
 
