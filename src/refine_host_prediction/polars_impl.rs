@@ -6,22 +6,24 @@ use polars::{
     chunked_array::StructChunked,
     datatypes::{
         ArrowDataType, BooleanChunked, DataType, Field, PlSmallStr, PolarsDataType, StringChunked,
-        StringType, UInt32Type, UInt32Chunked,
+        StringType, UInt32Chunked, UInt32Type,
     },
     error::PolarsResult,
     prelude::{
-        ChunkedBuilder, CsvWriterOptions, LazyCsvReader, LazyFileListReader, LazyFrame,
-        PrimitiveChunkedBuilder, SerializeOptions, StringChunkedBuilder,
+        arity::binary_elementwise, ChunkedBuilder, CsvWriterOptions, LazyCsvReader, LazyFileListReader, LazyFrame, PrimitiveChunkedBuilder, SerializeOptions, StringChunkedBuilder
     },
     series::{IntoSeries, Series},
 };
 use polars_arrow::{array::BooleanArray, bitmap::MutableBitmap};
-use polars_plan::dsl::GetOutput;
 use string_interner::DefaultSymbol;
 
 use crate::{
-    taxonomy::Taxonomy,
-    util::{self, interners::{Interned, Resolver}},
+    csv::polars::{ExprBinExt, ExprExt, ExprTryExt},
+    taxonomy::{LabeledTaxonomy, Taxonomy},
+    util::{
+        self,
+        interners::{Interned, Resolver},
+    },
 };
 
 use super::{Aggregation, HostSymbol, MetagenomicEvidence, RefineHostPredictionArgs, VirusSymbol};
@@ -201,12 +203,11 @@ where
         series.push(crisprs.finish());
     }
 
-    StructChunked::from_series(PlSmallStr::EMPTY, &series)
+    StructChunked::from_series(PlSmallStr::EMPTY, len, series.iter())
 }
 
-
 fn load_host_prediction(args: &RefineHostPredictionArgs) -> anyhow::Result<(LazyFrame, bool)> {
-    use polars::lazy::dsl::{col, lit};
+    use polars::lazy::dsl::col;
 
     let mut prediction = {
         let pathbuf = args.host_prediction.as_path().to_path_buf();
@@ -226,26 +227,17 @@ fn load_host_prediction(args: &RefineHostPredictionArgs) -> anyhow::Result<(Lazy
             .contains(columns::MERGED_CLASS_NAMES);
 
     if prediction_has_class_names {
-        prediction = prediction
-            .select([
-                col(columns::VIRUS_NAME),
-                col(columns::MERGED_TAXIDS).alias("predicted_taxid"),
-                col(columns::MERGED_CLASS_NAMES).alias("predicted_class_name"),
-            ])
-            .with_column(col("predicted_class_names").str().split(lit(";")))
+        prediction = prediction.select([
+            col(columns::VIRUS_NAME),
+            col(columns::MERGED_TAXIDS).alias("predicted_taxid"),
+            col(columns::MERGED_CLASS_NAMES).alias("predicted_class_name"),
+        ])
     } else {
         prediction = prediction.select([
             col(columns::VIRUS_NAME),
             col(columns::MERGED_TAXIDS).alias("predicted_taxid"),
-        ]);
+        ])
     }
-
-    prediction = prediction.with_column(
-        col("predicted_taxid")
-            .str()
-            .split(lit(";"))
-            .cast(DataType::List(DataType::UInt32.boxed())),
-    );
 
     Ok((prediction, prediction_has_class_names))
 }
@@ -262,20 +254,79 @@ where
     use polars::lazy::dsl::col;
 
     if has_class_names {
-        unimplemented!()
-    } else {
-        prediction.with_column(
-            col("predicted_taxids").map(|series| {
+        let struct_fields = [
+            Field {
+                name: PlSmallStr::from_static("predicted_taxids"),
+                dtype: DataType::UInt32,
+            },
+            Field {
+                name: PlSmallStr::from_static("predicted_class_names"),
+                dtype: DataType::String,
+            },
+        ];
 
-            })
-        )
+        prediction.with_column(col("predicted_taxids").downcast_map2_to(
+            Series::str,
+            "predicted_class_names",
+            Series::str,
+            DataType::List(DataType::Struct(struct_fields.into()).boxed()),
+            move |taxids, class_names| {
+                Some(binary_elementwise(taxids, class_names, |taxids, class_names| {
+                    let taxids = taxids?.split(';');
+                    let class_names = class_names?.split(';');
+
+                    let mut predictions = taxids
+                        .zip(class_names)
+                        .filter_map(move |(taxid, class_name)| {
+                            let taxid = taxid.parse().ok()?;
+                            let node = tax.fixup_node(taxid)?;
+                            let class_name = if class_name.is_empty() {
+                                None
+                            } else {
+                                Some(class_name)
+                            };
+                            let (node, class_name) =
+                                super::adjust_prediction_to_rank_with_names(
+                                    &*tax, rank_sym, node, class_name,
+                                )?;
+                            Some((u32::from(node), class_name))
+                        })
+                        .collect_vec();
+
+                    predictions.sort_by(|x, y| x.0.cmp(&y.0));
+                    predictions.dedup_by(|x, y| x.0 == y.0);
+                    let len = predictions.len();
+
+                    let (taxids_series, names_series) = predictions.into_iter().unzip();
+                    Some(StructChunked::from_series(PlSmallStr::EMPTY, len, [&taxids_series, &names_series].into_iter()))
+                }))
+            },
+        ))
+    } else {
+        prediction.with_column(col("predicted_taxids").downcast_map_apply_to_vec(
+            Series::str,
+            move |taxids| {
+                let mut taxids = taxids
+                    .split(';')
+                    .filter_map(|taxid| {
+                        let taxid = taxid.parse().ok()?;
+                        let node = tax.fixup_node(taxid)?;
+                        super::adjust_prediction_to_rank(&*tax, rank_sym, node).map(u32::from)
+                    })
+                    .collect_vec();
+
+                taxids.sort();
+                taxids.dedup();
+                Some(taxids)
+            },
+        ))
     }
 }
-
 
 pub(super) fn refine_host_prediction_with_tax_impl<Tax, VI, HI>(
     args: &RefineHostPredictionArgs,
     tax: Arc<Tax>,
+    rank_sym: Option<Tax::RankSym>,
     evidence: MetagenomicEvidence<VI, HI>,
 ) -> anyhow::Result<()>
 where
@@ -283,58 +334,71 @@ where
     VI: Interned<Symbol = DefaultSymbol, ValueHKT = HKTRef<str>> + Send + Sync + 'static,
     HI: Interned<Symbol = DefaultSymbol, ValueHKT = HKTRef<str>> + Send + Sync + 'static,
 {
-    use polars::lazy::dsl::col;
-
-    let output_type = GetOutput::from_type(enrichment_dtype(&evidence));
-
-    let opts = args.refinement_options.clone();
+    use polars::lazy::dsl::{col, lit};
 
     // TODO: Run in parallel. Requires https://github.com/pola-rs/polars/issues/7243
     // Until then, disabling feature = refine_host_prediction_polars falls back to csv + rayon.
 
-    let (prediction, has_class_names) = load_host_prediction(args)?;
+    let (mut prediction, has_class_names) = load_host_prediction(args)?;
 
-    let prediction = if let Some(rank) = &args.refinement_options.rank {
-        let rank_sym = tax.lookup_rank_sym(rank).ok_or_else(|| {
-            anyhow::anyhow!("Rank not found in the taxonomy: {}", rank)
-        })?;
-
-        adjust_predictions_to_rank(tax, rank_sym, prediciton, has_class_names);
+    if let Some(rank_sym) = rank_sym {
+        prediction =
+            adjust_predictions_to_rank(Arc::clone(&tax), rank_sym, prediction, has_class_names);
     } else {
+        prediction = prediction.with_column(
+            col("predicted_taxid")
+                .str()
+                .split(lit(";"))
+                .cast(DataType::List(DataType::UInt32.boxed())),
+        );
+
         if has_class_names {
-            prediction.explode(["predicted_taxid", "predicted_class_name"])
+            prediction = prediction
+                .with_column(col("predicted_class_names").str().split(lit(";")))
+                .explode(["predicted_taxid", "predicted_class_name"])
         } else {
-            prediction.explode(["predicted_taxid"])
-        };
+            prediction = prediction.explode(["predicted_taxid"])
+        }
     };
 
-    prediction
+    let opts = args.refinement_options.clone();
+    let output_dtype = enrichment_dtype(&evidence);
+
+    prediction = prediction
         .with_column(
             col("predicted_taxid")
-                .map_many(
-                    move |series| {
-                        let taxids = series[0].u32()?;
-                        let virus_name = series[1].str()?;
-
+                .downcast_try_map2_to(
+                    Series::u32,
+                    "virus_name",
+                    Series::str,
+                    output_dtype,
+                    move |taxids, virus_name| {
                         macro_rules! refine_and_enrich_chunked_with {
                             ($contig_agg:ty, $crispr_agg:ty) => {
-                                refine_and_enrich_chunked::<_, _, _, $contig_agg, $crispr_agg>(&evidence, &*tax, virus_name, taxids)
-                            }
+                                refine_and_enrich_chunked::<_, _, _, $contig_agg, $crispr_agg>(
+                                    &evidence, &*tax, virus_name, taxids,
+                                )
+                            };
                         }
 
                         use Aggregation::*;
 
-                        let result = match (opts.agg_contigs, opts.agg_crispr) {
-                            (List,  List) => refine_and_enrich_chunked_with!(ListAggregator, ListAggregator)?,
-                            (List,  Count) => refine_and_enrich_chunked_with!(ListAggregator, CountingAggregator)?,
-                            (Count, List) => refine_and_enrich_chunked_with!(CountingAggregator, ListAggregator)?,
-                            (Count, Count) => refine_and_enrich_chunked_with!(CountingAggregator, CountingAggregator)?,
-                        };
-
-                        Ok(Some(result.into_series()))
+                        match (opts.agg_contigs, opts.agg_crispr) {
+                            (List, List) => {
+                                refine_and_enrich_chunked_with!(ListAggregator, ListAggregator)
+                            }
+                            (List, Count) => {
+                                refine_and_enrich_chunked_with!(ListAggregator, CountingAggregator)
+                            }
+                            (Count, List) => {
+                                refine_and_enrich_chunked_with!(CountingAggregator, ListAggregator)
+                            }
+                            (Count, Count) => refine_and_enrich_chunked_with!(
+                                CountingAggregator,
+                                CountingAggregator
+                            ),
+                        }
                     },
-                    &[col("virus_name")],
-                    output_type
                 )
                 .alias("evidence"),
         )
@@ -353,8 +417,74 @@ where
                 },
                 ..Default::default()
             },
+            None,
         )
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use polars::{error::PolarsResult, prelude::IntoLazy};
+
+    use crate::{
+        csv::polars::{series_opt_vec, series_vec},
+        taxonomy::{NodeId, Taxonomy, formats::newick},
+    };
+
+    use super::adjust_predictions_to_rank;
+
+    #[test]
+    fn test_adjust_predictions_to_rank() -> PolarsResult<()> {
+        let tax = Arc::new(newick::tests::sample_taxonomy());
+        let rank_sym = tax.lookup_rank_sym("family").unwrap();
+
+        let prediction = polars::df!(
+            "virus_name" => ["v1", "v2", "v3"],
+            "predicted_taxids" => ["7;8;11;5", "4", "27;32"],
+            "predicted_class_names" => ["s7;s8;s11;f5", "o4", "s27;s32"],
+        )?;
+
+        let taxids = vec![7, 8, 11, 5, 4, 27, 32];
+        let expected_at_rank = vec![Some(5), Some(5), Some(5), Some(5), None, Some(22), Some(30)];
+
+        for (taxid, expected) in taxids.into_iter().zip(expected_at_rank) {
+            assert_eq!(
+                super::super::adjust_prediction_to_rank(&*tax, rank_sym, NodeId::from(taxid)),
+                expected.map(NodeId::from)
+            );
+        }
+
+        let result = adjust_predictions_to_rank(
+            Arc::clone(&tax),
+            rank_sym,
+            prediction
+                .select(["virus_name", "predicted_taxids"])?
+                .lazy(),
+            false,
+        )
+        .collect()?;
+
+        let expected = polars::df!(
+            "virus_name" => ["v1", "v2", "v3"],
+            "predicted_taxids" => series_vec([
+                vec![5], vec![], vec![22,30],
+            ]),
+            "predicted_class_names" => series_vec([
+                vec![Some("f5")], vec![Some("x22")], vec![Some("f22"), Some("f30")]
+            ]),
+        )?;
+
+        assert_eq!(result, expected.select(["virus_name", "predicted_taxids"])?);
+
+        let result =
+            adjust_predictions_to_rank(tax, rank_sym, prediction.lazy(), true).collect()?;
+
+        assert_eq!(result, expected);
+
+        Ok(())
+    }
 }

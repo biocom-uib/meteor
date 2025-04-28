@@ -1,17 +1,20 @@
-use std::sync::{mpsc::Receiver, Arc};
 use std::io::Write;
+use std::sync::{Arc, mpsc::Receiver};
 
 use csv::StringRecord;
-use lending_iterator::higher_kinded_types::HKTRef;
 use itertools::{Either, Itertools};
+use lending_iterator::higher_kinded_types::HKTRef;
 use rayon::iter::{ParallelBridge, ParallelIterator};
 use string_interner::DefaultSymbol;
 
 use crate::taxonomy::LabeledTaxonomy;
+use crate::{taxonomy::NodeId, util::interners::Interned};
 use crate::{util, writing_new_file_or_stdout};
-use crate::{taxonomy::{NodeId, tree::walk::RootedTreeWalk}, util::interners::Interned};
 
-use super::{Aggregation, HostSymbol, MetagenomicEvidence, RefineHostPredictionArgs, RefinementOptions, VirusSymbol};
+use super::{
+    Aggregation, HostSymbol, MetagenomicEvidence, RefineHostPredictionArgs, RefinementOptions,
+    VirusSymbol, adjust_prediction_to_rank_with_names,
+};
 
 struct HostPredictionRecord {
     record: StringRecord,
@@ -26,7 +29,9 @@ impl HostPredictionRecord {
     }
 
     fn predicted_taxids(&self) -> impl Iterator<Item = Option<u32>> + '_ {
-        self.record[self.merged_taxids_idx].split(';').map(|taxid| taxid.parse().ok())
+        self.record[self.merged_taxids_idx]
+            .split(';')
+            .map(|taxid| taxid.parse().ok())
     }
 
     fn predicted_class_names(&self) -> Option<impl Iterator<Item = &str> + '_> {
@@ -51,7 +56,7 @@ struct RefinedRecord {
     predicted_taxid: NodeId,
     predicted_class_name: Option<String>,
     assigned_contigs: String,
-    crispr_matches: Option<String>
+    crispr_matches: Option<String>,
 }
 
 impl RefinedRecord {
@@ -60,7 +65,6 @@ impl RefinedRecord {
         has_crispr: bool,
         writer: &mut csv::Writer<W>,
     ) -> csv::Result<()> {
-
         writer.write_field("virus_name")?;
         writer.write_field("predicted_taxid")?;
 
@@ -167,7 +171,7 @@ fn record_predictions<'a, Tax>(
     record: &'a HostPredictionRecord,
 ) -> impl Iterator<Item = (NodeId, Option<&'a str>)> + 'a
 where
-    Tax: LabeledTaxonomy
+    Tax: LabeledTaxonomy,
 {
     let predictions = record.predictions().filter_map(move |(taxid, class_name)| {
         let taxid = taxid?;
@@ -184,31 +188,18 @@ where
         return Either::Left(predictions);
     };
 
-    let mut predictions_vec = predictions.filter_map(move |(node, class_name)| {
-        if tax.find_rank(node) == Some(rank_sym) {
-            Some((node, class_name))
-        } else {
-            let ancestor_at_rank = tax
-                .strict_ancestors(node)
-                .find(move |ancestor| tax.find_rank(*ancestor) == Some(rank_sym))?;
-
-            let ancestor_class_name = if class_name.is_some() {
-                tax.some_label_of(ancestor_at_rank)
-            } else {
-                None
-            };
-
-            Some((ancestor_at_rank, ancestor_class_name))
-        }
-    })
-    .collect_vec();
+    let mut predictions_vec = predictions
+        .filter_map(move |(node, class_name)| {
+            // TODO: can be optimized if !has_class_names
+            adjust_prediction_to_rank_with_names(tax, rank_sym, node, class_name)
+        })
+        .collect_vec();
 
     predictions_vec.sort_by(|x, y| x.0.cmp(&y.0));
     predictions_vec.dedup_by(|x, y| x.0 == y.0);
 
     Either::Right(predictions_vec.into_iter())
 }
-
 
 fn refine_record<'a, Tax, VI, HI>(
     evidence: &'a MetagenomicEvidence<VI, HI>,
@@ -287,6 +278,7 @@ fn write_records(
 pub fn refine_host_prediction_with_tax_impl<Tax, VI, HI>(
     args: &RefineHostPredictionArgs,
     tax: Arc<Tax>,
+    rank_sym: Option<Tax::RankSym>,
     evidence: MetagenomicEvidence<VI, HI>,
 ) -> anyhow::Result<()>
 where
@@ -301,27 +293,18 @@ where
 
     let (has_class_names, host_prediction) = load_host_prediction(args)?;
 
-    let rank_sym =
-        if let Some(rank) = &args.refinement_options.rank {
-            Some(tax.lookup_rank_sym(rank).ok_or_else(|| {
-                anyhow::anyhow!("Rank not found in the taxonomy: {}", rank)
-            })?)
-        } else {
-            None
-        };
-
     let (rp, rc) = rayon::join(
         move || {
-            host_prediction.par_bridge().try_for_each_with(
-                sender,
-                move |sender, record| {
+            host_prediction
+                .par_bridge()
+                .try_for_each_with(sender, move |sender, record| {
                     let record = record?;
-                    let records = refine_record(evidence, &args.refinement_options, &*tax, rank_sym, &record)
-                        .collect();
+                    let records =
+                        refine_record(evidence, &args.refinement_options, &*tax, rank_sym, &record)
+                            .collect();
                     sender.send(records)?;
                     anyhow::Ok(())
-                },
-            )
+                })
         },
         move || {
             writing_new_file_or_stdout!(args.output.as_ref(), writer => {
@@ -334,4 +317,55 @@ where
     rp?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use csv::StringRecord;
+    use itertools::Itertools;
+
+    use crate::{
+        refine_host_prediction::csv_impl::{record_predictions, HostPredictionRecord}, taxonomy::{formats::newick, NodeId, Taxonomy}
+    };
+
+    #[test]
+    fn test_record_predictions() -> anyhow::Result<()> {
+        let tax = newick::tests::sample_taxonomy();
+        let rank_sym = tax.lookup_rank_sym("family").unwrap();
+
+        let records = [
+            ("v1", "7;8;11;5", "s7;s8;s11;f5"),
+            ("v2", "4", "o4"),
+            ("v3", "22;32", "x22;s32"),
+        ];
+
+        let expected = [
+            ("v1", vec![NodeId(5)], vec![Some("f5")]),
+            ("v2", vec![], vec![]),
+            ("v3", vec![NodeId(22), NodeId(30)], vec![Some("x22"), Some("f30")]),
+        ];
+
+        let records = records
+            .into_iter()
+            .map(|(virus_name, taxids, names)| {
+                HostPredictionRecord {
+                    record: StringRecord::from_iter([virus_name, taxids, names]),
+                    virus_name_idx: 0,
+                    merged_taxids_idx: 1,
+                    merged_class_names_idx: Some(2),
+                }
+            })
+            .collect_vec();
+
+        for (record, expected) in records.into_iter().zip(expected) {
+            let (ids, names): (Vec<_>, Vec<_>) = record_predictions(&tax, Some(rank_sym), &record).unzip();
+
+            assert_eq!(ids, expected.1);
+            assert_eq!(names, expected.2);
+        }
+
+        Ok(())
+    }
 }

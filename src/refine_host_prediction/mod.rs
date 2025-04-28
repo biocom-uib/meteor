@@ -10,10 +10,11 @@ use string_interner::DefaultSymbol;
 
 use crate::{
     csv::stream::{self as csv_stream, CsvReaderIterExt},
-    preprocessed_taxonomy::{with_some_taxonomy, PreprocessedTaxonomyArgs},
+    preprocessed_taxonomy::{PreprocessedTaxonomyArgs, with_some_taxonomy},
     tango_assign::AssignmentRecord,
     taxonomy::{
-        tree::{postorder_ann::PostorderAnnPool, walk::LcaCache, NodeId}, LabeledTaxonomy, RootedTree, Taxonomy
+        LabeledTaxonomy, RootedTree, Taxonomy,
+        tree::{NodeId, postorder_ann::PostorderAnnPool, walk::{LcaCache, RootedTreeWalk}},
     },
     util::{
         clap::{ExistingFilePath, OutputFileFlag},
@@ -327,6 +328,39 @@ impl<VI: Resolver, HI: Resolver> MetagenomicEvidence<VI, HI> {
     }
 }
 
+fn adjust_prediction_to_rank<Tax>(tax: &Tax, rank_sym: Tax::RankSym, node: NodeId) -> Option<NodeId>
+where
+    Tax: Taxonomy,
+{
+    if tax.find_rank(node) == Some(rank_sym) {
+        Some(node)
+    } else {
+        tax
+            .strict_ancestors(node)
+            .find(move |ancestor| tax.find_rank(*ancestor) == Some(rank_sym))
+    }
+}
+
+fn adjust_prediction_to_rank_with_names<'a, Tax>(
+    tax: &'a Tax,
+    rank_sym: Tax::RankSym,
+    node: NodeId,
+    class_name: Option<&'a str>,
+) -> Option<(NodeId, Option<&'a str>)>
+where
+    Tax: LabeledTaxonomy
+{
+    let ancestor_at_rank = adjust_prediction_to_rank(tax, rank_sym, node)?;
+
+    let ancestor_class_name = if node == ancestor_at_rank {
+        class_name
+    } else {
+        tax.some_label_of(ancestor_at_rank)
+    };
+
+    Some((ancestor_at_rank, ancestor_class_name))
+}
+
 pub fn refine_host_prediction_with_tax<Tax>(
     args: RefineHostPredictionArgs,
     tax: Tax,
@@ -338,6 +372,16 @@ where
 
     let tax = Arc::new(tax);
     let lca_cache = LcaCache::compute(&*tax);
+
+    let rank_sym = if let Some(rank) = &args.refinement_options.rank {
+        if let Some(rank_sym) = tax.lookup_rank_sym(rank) {
+            Some(rank_sym)
+        } else {
+            anyhow::bail!("Rank not found in the taxonomy: {}", rank)
+        }
+    } else {
+        None
+    };
 
     let mut virus_interner = DefaultStringInterner::new();
     let mut host_interner = DefaultStringInterner::new();
@@ -367,7 +411,7 @@ where
 
     eprintln!("Refining...");
 
-    refine_host_prediction_with_tax_impl(&args, tax, evidence)
+    refine_host_prediction_with_tax_impl(&args, tax, rank_sym, evidence)
 }
 
 pub fn refine_host_prediction(args: RefineHostPredictionArgs) -> anyhow::Result<()> {

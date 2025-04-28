@@ -9,8 +9,7 @@ use polars::{
     error::PolarsResult,
     lazy::dsl::Expr,
     prelude::{
-        arity::unary_elementwise, ChunkedCollectIterExt, IntoColumn, JoinBuilder, JoinCoalesce,
-        JoinType, JoinValidation, LazyCsvReader, LazyFileListReader, LazyFrame, Schema,
+        arity::{binary_elementwise, unary_elementwise}, ChunkedCollectIterExt, IntoColumn, JoinBuilder, JoinCoalesce, JoinType, JoinValidation, LazyCsvReader, LazyFileListReader, LazyFrame, Schema
     },
     series::{IntoSeries, Series},
 };
@@ -84,9 +83,7 @@ pub trait PolarsSchema {
 }
 
 pub fn default_tsv_options(reader: LazyCsvReader) -> LazyCsvReader {
-    reader
-        .with_has_header(true)
-        .with_separator(b'\t')
+    reader.with_has_header(true).with_separator(b'\t')
 }
 
 pub fn schema_subset<'s>(
@@ -134,7 +131,7 @@ pub fn lazyframe_from_string_strip<Record: PolarsSchema>(string: &str) -> Polars
     let string = leading.replace_all(string, "");
     let string = middle.replace_all(&string, "\t");
     let string = trailing.replace_all(&string, "");
-    let bytes_buf = string.into_owned().into();
+    let bytes_buf = string.into_owned().into_bytes().into();
 
     lazyframe_from::<Record>(ScanSources::Buffers(Arc::new([bytes_buf])))
 }
@@ -151,24 +148,22 @@ pub fn full_join_builder(df1: LazyFrame, df2: LazyFrame) -> JoinBuilder {
 pub fn col_list_concat(col1: &str, col2: &str) -> Expr {
     use polars::lazy::dsl::{col, when};
 
-    when(col(col1).is_null())
-        .then(col(col2))
-        .otherwise(
-            when(col(col2).is_null())
+    when(col(col1).is_null()).then(col(col2)).otherwise(
+        when(col(col2).is_null())
             .then(col(col1))
-            .otherwise(polars::prelude::concat_list([col(col1), col(col2)]).unwrap()))
+            .otherwise(polars::prelude::concat_list([col(col1), col(col2)]).unwrap()),
+    )
 }
 
 // union two list columns that can be null
 pub fn col_list_union(col1: &str, col2: &str) -> Expr {
     use polars::lazy::dsl::{col, when};
 
-    when(col(col1).is_null())
-        .then(col(col2))
-        .otherwise(
-            when(col(col2).is_null())
+    when(col(col1).is_null()).then(col(col2)).otherwise(
+        when(col(col2).is_null())
             .then(col(col1))
-            .otherwise(col(col1).list().union(col(col2))))
+            .otherwise(col(col1).list().union(col(col2))),
+    )
 }
 
 #[cfg(test)]
@@ -202,26 +197,40 @@ where
 }
 
 pub trait ExprExt: Sized {
+    fn downcast_map_to<T, U, C, F>(self, cast: C, output_dtype: DataType, f: F) -> Self
+    where
+        C: Fn(&Series) -> PolarsResult<&ChunkedArray<T>> + Send + Sync + 'static,
+        F: Fn(&ChunkedArray<T>) -> ChunkedArray<U> + Send + Sync + 'static,
+        T: PolarsDataType,
+        U: PolarsDataType,
+        ChunkedArray<U>: IntoSeries;
+
     fn downcast_map<T, U, C, F>(self, cast: C, f: F) -> Self
     where
         C: Fn(&Series) -> PolarsResult<&ChunkedArray<T>> + Send + Sync + 'static,
         F: Fn(&ChunkedArray<T>) -> ChunkedArray<U> + Send + Sync + 'static,
         T: PolarsDataType<IsNested = FalseT>,
         U: PolarsDataType<IsNested = FalseT>,
-        ChunkedArray<U>: IntoSeries;
+        ChunkedArray<U>: IntoSeries,
+    {
+        self.downcast_map_to(cast, U::get_dtype(), f)
+    }
 
     fn downcast_map_to_list<T, C, F>(self, cast: C, output_inner: DataType, f: F) -> Self
     where
         C: Fn(&Series) -> PolarsResult<&ChunkedArray<T>> + Send + Sync + 'static,
         F: Fn(&ChunkedArray<T>) -> ListChunked + Send + Sync + 'static,
-        T: PolarsDataType<IsNested = FalseT>;
+        T: PolarsDataType,
+    {
+        self.downcast_map_to(cast, DataType::List(output_inner.boxed()), f)
+    }
 
-    fn downcast_map_lists<T, U, C, IF>(self, inner_cast: C, inner_f: IF) -> Self
+    fn downcast_map_lists<T, U, IC, IF>(self, inner_cast: IC, inner_f: IF) -> Self
     where
-        C: Fn(&Series) -> PolarsResult<&ChunkedArray<T>> + Send + Sync + 'static,
+        IC: Fn(&Series) -> PolarsResult<&ChunkedArray<T>> + Send + Sync + 'static,
         IF: Fn(&ChunkedArray<T>) -> ChunkedArray<U> + Send + Sync + 'static,
-        T: PolarsDataType<IsNested = FalseT>,
-        U: PolarsDataType<IsNested = FalseT>,
+        T: PolarsDataType,
+        U: PolarsDataType,
         ChunkedArray<U>: IntoSeries;
 
     fn downcast_map_apply<T, B, C, F>(self, cast: C, f: F) -> Self
@@ -231,7 +240,7 @@ pub trait ExprExt: Sized {
         T: PolarsDataType<IsNested = FalseT>,
         B: PolarsCompatible<DataType: PolarsDataType<IsNested = FalseT>>,
         <B::DataType as PolarsDataType>::Array: ArrayFromIter<Option<B>>,
-        ChunkedArray<B::DataType>: IntoSeries
+        ChunkedArray<B::DataType>: IntoSeries,
     {
         self.downcast_map(cast, move |chunked| {
             unary_elementwise::<T, B::DataType, _>(chunked, |t| f(t?))
@@ -256,11 +265,7 @@ pub trait ExprExt: Sized {
         B::DataType: PolarsNumericType<Native = B, Array = PrimitiveArray<B>>,
         ChunkedArray<B::DataType>: IntoSeries,
     {
-        self.downcast_map_apply_to_chunk(cast, move |t| {
-            Some(
-                PrimitiveArray::<B>::from_vec(f(t)?)
-            )
-        })
+        self.downcast_map_apply_to_chunk(cast, move |t| Some(PrimitiveArray::<B>::from_vec(f(t)?)))
     }
 
     fn downcast_map_apply_to_chunk<T, B, C, F>(self, cast: C, f: F) -> Self
@@ -282,39 +287,181 @@ pub trait ExprExt: Sized {
     }
 }
 
+pub trait ExprTryExt: ExprBinExt {
+    fn downcast_try_map_to<T, U, C, F>(self, cast: C, output_dtype: DataType, f: F) -> Self
+    where
+        C: Fn(&Series) -> PolarsResult<&ChunkedArray<T>> + Send + Sync + 'static,
+        F: Fn(&ChunkedArray<T>) -> PolarsResult<ChunkedArray<U>> + Send + Sync + 'static,
+        T: PolarsDataType,
+        U: PolarsDataType,
+        ChunkedArray<U>: IntoSeries;
+
+    fn downcast_try_map2_to<T1, T2, U, C1, C2, F>(
+        self,
+        cast1: C1,
+        col2_name: &str,
+        cast2: C2,
+        output_dtype: DataType,
+        f: F,
+    ) -> Self
+    where
+        C1: Fn(&Series) -> PolarsResult<&ChunkedArray<T1>> + Send + Sync + 'static,
+        C2: Fn(&Series) -> PolarsResult<&ChunkedArray<T2>> + Send + Sync + 'static,
+        F: Fn(&ChunkedArray<T1>, &ChunkedArray<T2>) -> PolarsResult<ChunkedArray<U>>
+            + Send
+            + Sync
+            + 'static,
+        T1: PolarsDataType,
+        T2: PolarsDataType,
+        U: PolarsDataType,
+        ChunkedArray<U>: IntoSeries;
+}
+
+pub trait ExprBinExt: ExprExt {
+    fn downcast_map2_to<T1, T2, U, C1, C2, F>(
+        self,
+        cast1: C1,
+        col2_name: &str,
+        cast2: C2,
+        output_dtype: DataType,
+        f: F,
+    ) -> Self
+    where
+        C1: Fn(&Series) -> PolarsResult<&ChunkedArray<T1>> + Send + Sync + 'static,
+        C2: Fn(&Series) -> PolarsResult<&ChunkedArray<T2>> + Send + Sync + 'static,
+        F: Fn(&ChunkedArray<T1>, &ChunkedArray<T2>) -> ChunkedArray<U> + Send + Sync + 'static,
+        T1: PolarsDataType,
+        T2: PolarsDataType,
+        U: PolarsDataType,
+        ChunkedArray<U>: IntoSeries;
+
+    fn downcast_map2<T1, T2, U, C1, C2, F>(
+        self,
+        cast1: C1,
+        col2_name: &str,
+        cast2: C2,
+        f: F,
+    ) -> Self
+    where
+        C1: Fn(&Series) -> PolarsResult<&ChunkedArray<T1>> + Send + Sync + 'static,
+        C2: Fn(&Series) -> PolarsResult<&ChunkedArray<T2>> + Send + Sync + 'static,
+        F: Fn(&ChunkedArray<T1>, &ChunkedArray<T2>) -> ChunkedArray<U> + Send + Sync + 'static,
+        T1: PolarsDataType,
+        T2: PolarsDataType,
+        U: PolarsDataType<IsNested = FalseT>,
+        ChunkedArray<U>: IntoSeries,
+    {
+        self.downcast_map2_to(cast1, col2_name, cast2, U::get_dtype(), f)
+    }
+
+    fn downcast_map2_to_list<T1, T2, C1, C2, F>(
+        self,
+        cast1: C1,
+        col2_name: &str,
+        cast2: C2,
+        output_inner: DataType,
+        f: F,
+    ) -> Self
+    where
+        C1: Fn(&Series) -> PolarsResult<&ChunkedArray<T1>> + Send + Sync + 'static,
+        C2: Fn(&Series) -> PolarsResult<&ChunkedArray<T2>> + Send + Sync + 'static,
+        F: Fn(&ChunkedArray<T1>, &ChunkedArray<T2>) -> ListChunked + Send + Sync + 'static,
+        T1: PolarsDataType,
+        T2: PolarsDataType,
+    {
+        self.downcast_map2_to(
+            cast1,
+            col2_name,
+            cast2,
+            DataType::List(output_inner.boxed()),
+            f,
+        )
+    }
+
+    fn downcast_map2_apply_to_vec<T1, T2, B, C1, C2, F>(
+        self,
+        cast1: C1,
+        col2_name: &str,
+        cast2: C2,
+        f: F,
+    ) -> Self
+    where
+        C1: Fn(&Series) -> PolarsResult<&ChunkedArray<T1>> + Send + Sync + 'static,
+        C2: Fn(&Series) -> PolarsResult<&ChunkedArray<T2>> + Send + Sync + 'static,
+        F: Fn(T1::Physical<'_>, T2::Physical<'_>) -> Option<Vec<B>> + Send + Sync + 'static,
+        T1: PolarsDataType<IsNested = FalseT>,
+        T2: PolarsDataType<IsNested = FalseT>,
+        B: PolarsCompatible + NativeType + NumericNative,
+        B::DataType: PolarsNumericType<Native = B, Array = PrimitiveArray<B>>,
+        ChunkedArray<B::DataType>: IntoSeries,
+    {
+        self.downcast_map2_apply_to_chunk(cast1, col2_name, cast2, move |t1, t2| {
+            Some(PrimitiveArray::<B>::from_vec(f(t1, t2)?))
+        })
+    }
+
+    fn downcast_map2_apply_to_chunk<T1, T2, B, C1, C2, F>(
+        self,
+        cast1: C1,
+        col2_name: &str,
+        cast2: C2,
+        f: F,
+    ) -> Self
+    where
+        C1: Fn(&Series) -> PolarsResult<&ChunkedArray<T1>> + Send + Sync + 'static,
+        C2: Fn(&Series) -> PolarsResult<&ChunkedArray<T2>> + Send + Sync + 'static,
+        F: Fn(T1::Physical<'_>, T2::Physical<'_>) -> Option<PrimitiveArray<B>>
+            + Send
+            + Sync
+            + 'static,
+        T1: PolarsDataType<IsNested = FalseT>,
+        T2: PolarsDataType<IsNested = FalseT>,
+        B: NumericNative + PolarsCompatible,
+    {
+        self.downcast_map2_to_list(
+            cast1,
+            col2_name,
+            cast2,
+            B::DataType::get_dtype(),
+            move |chunked1, chunked2| {
+                chunked1
+                    .iter()
+                    .zip(chunked2.iter())
+                    .map(|(t1, t2)| Some::<Box<dyn Array>>(Box::new(f(t1?, t2?)?)))
+                    .collect_ca_trusted_with_dtype(
+                        PlSmallStr::EMPTY,
+                        DataType::List(B::DataType::get_dtype().boxed()),
+                    )
+            },
+        )
+    }
+}
+
 impl ExprExt for Expr {
-    fn downcast_map<T, U, C, F>(self, cast: C, f: F) -> Self
+    fn downcast_map_to<T, U, C, F>(self, cast: C, output_dtype: DataType, f: F) -> Self
     where
         C: Fn(&Series) -> PolarsResult<&ChunkedArray<T>> + Send + Sync + 'static,
         F: Fn(&ChunkedArray<T>) -> ChunkedArray<U> + Send + Sync + 'static,
-        T: PolarsDataType<IsNested = FalseT>,
-        U: PolarsDataType<IsNested = FalseT>,
-        ChunkedArray<U>: IntoSeries
+        T: PolarsDataType,
+        U: PolarsDataType,
+        ChunkedArray<U>: IntoSeries,
     {
         self.map(
-            move |column| Ok(Some(f(cast(column.as_materialized_series())?).into_column())),
-            GetOutput::from_type(U::get_dtype()),
+            move |column| {
+                Ok(Some(
+                    f(cast(column.as_materialized_series())?).into_column(),
+                ))
+            },
+            GetOutput::from_type(output_dtype),
         )
     }
 
-    fn downcast_map_to_list<T, C, F>(self, cast: C, output_inner: DataType, f: F) -> Self
+    fn downcast_map_lists<T, U, IC, IF>(self, inner_cast: IC, inner_f: IF) -> Self
     where
-        C: Fn(&Series) -> PolarsResult<&ChunkedArray<T>> + Send + Sync + 'static,
-        F: Fn(&ChunkedArray<T>) -> ListChunked + Send + Sync + 'static,
-        T: PolarsDataType<IsNested = FalseT>,
-    {
-        self.map(
-            move |column| Ok(Some(f(cast(column.as_materialized_series())?).into_column())),
-            GetOutput::from_type(DataType::List(output_inner.boxed())),
-        )
-    }
-
-    fn downcast_map_lists<T, U, C, IF>(self, inner_cast: C, inner_f: IF) -> Self
-    where
-        C: Fn(&Series) -> PolarsResult<&ChunkedArray<T>> + Send + Sync + 'static,
+        IC: Fn(&Series) -> PolarsResult<&ChunkedArray<T>> + Send + Sync + 'static,
         IF: Fn(&ChunkedArray<T>) -> ChunkedArray<U> + Send + Sync + 'static,
-        T: PolarsDataType<IsNested = FalseT>,
-        U: PolarsDataType<IsNested = FalseT>,
+        T: PolarsDataType,
+        U: PolarsDataType,
         ChunkedArray<U>: IntoSeries,
     {
         self.map_list(
@@ -330,6 +477,93 @@ impl ExprExt for Expr {
                 Ok(Some(result.into_column()))
             },
             GetOutput::from_type(DataType::List(U::get_dtype().boxed())),
+        )
+    }
+}
+
+impl ExprBinExt for Expr {
+    fn downcast_map2_to<T1, T2, U, C1, C2, F>(
+        self,
+        cast1: C1,
+        col2_name: &str,
+        cast2: C2,
+        output_dtype: DataType,
+        f: F,
+    ) -> Self
+    where
+        C1: Fn(&Series) -> PolarsResult<&ChunkedArray<T1>> + Send + Sync + 'static,
+        C2: Fn(&Series) -> PolarsResult<&ChunkedArray<T2>> + Send + Sync + 'static,
+        F: Fn(&ChunkedArray<T1>, &ChunkedArray<T2>) -> ChunkedArray<U> + Send + Sync + 'static,
+        T1: PolarsDataType,
+        T2: PolarsDataType,
+        U: PolarsDataType,
+        ChunkedArray<U>: IntoSeries,
+    {
+        use polars::prelude::col;
+
+        self.map_many(
+            move |columns| {
+                let col1 = cast1(columns[0].as_materialized_series())?;
+                let col2 = cast2(columns[1].as_materialized_series())?;
+
+                Ok(Some(f(col1, col2).into_column()))
+            },
+            &[col(col2_name)],
+            GetOutput::from_type(output_dtype),
+        )
+    }
+}
+
+impl ExprTryExt for Expr {
+    fn downcast_try_map_to<T, U, C, F>(self, cast: C, output_dtype: DataType, f: F) -> Self
+    where
+        C: Fn(&Series) -> PolarsResult<&ChunkedArray<T>> + Send + Sync + 'static,
+        F: Fn(&ChunkedArray<T>) -> PolarsResult<ChunkedArray<U>> + Send + Sync + 'static,
+        T: PolarsDataType,
+        U: PolarsDataType,
+        ChunkedArray<U>: IntoSeries,
+    {
+        self.map(
+            move |column| {
+                Ok(Some(
+                    f(cast(column.as_materialized_series())?)?.into_column(),
+                ))
+            },
+            GetOutput::from_type(output_dtype),
+        )
+    }
+
+    fn downcast_try_map2_to<T1, T2, U, C1, C2, F>(
+        self,
+        cast1: C1,
+        col2_name: &str,
+        cast2: C2,
+        output_dtype: DataType,
+        f: F,
+    ) -> Self
+    where
+        C1: Fn(&Series) -> PolarsResult<&ChunkedArray<T1>> + Send + Sync + 'static,
+        C2: Fn(&Series) -> PolarsResult<&ChunkedArray<T2>> + Send + Sync + 'static,
+        F: Fn(&ChunkedArray<T1>, &ChunkedArray<T2>) -> PolarsResult<ChunkedArray<U>>
+            + Send
+            + Sync
+            + 'static,
+        T1: PolarsDataType,
+        T2: PolarsDataType,
+        U: PolarsDataType,
+        ChunkedArray<U>: IntoSeries,
+    {
+        use polars::prelude::col;
+
+        self.map_many(
+            move |columns| {
+                let col1 = cast1(columns[0].as_materialized_series())?;
+                let col2 = cast2(columns[1].as_materialized_series())?;
+
+                Ok(Some(f(col1, col2)?.into_column()))
+            },
+            &[col(col2_name)],
+            GetOutput::from_type(output_dtype),
         )
     }
 }
