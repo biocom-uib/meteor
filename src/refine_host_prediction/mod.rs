@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use clap::{Args, ValueEnum};
 use lending_iterator::{
-    higher_kinded_types::{HKTRef, HKT},
     LendingIterator,
+    higher_kinded_types::{HKT, HKTRef},
 };
 use metagenomic_matches::{MergeCrisprMatchArgs, MetagenomicMatches};
 use string_interner::DefaultSymbol;
@@ -14,7 +14,11 @@ use crate::{
     tango_assign::AssignmentRecord,
     taxonomy::{
         LabeledTaxonomy, RootedTree, Taxonomy,
-        tree::{NodeId, postorder_ann::PostorderAnnPool, walk::{LcaCache, RootedTreeWalk}},
+        tree::{
+            NodeId,
+            postorder_ann::PostorderAnnPool,
+            walk::{LcaCache, RootedTreeWalk},
+        },
     },
     util::{
         clap::{ExistingFilePath, OutputFileFlag},
@@ -22,12 +26,10 @@ use crate::{
     },
 };
 
-
 mod metagenomic_matches;
 
 mod csv_impl;
 use csv_impl::refine_host_prediction_with_tax_impl;
-
 
 #[derive(Copy, Clone, PartialEq, Eq, Default, ValueEnum)]
 pub enum TreeRelation {
@@ -106,7 +108,6 @@ pub struct RefineHostPredictionArgs {
 
     #[clap(flatten)]
     crispr_args: Option<MergeCrisprMatchArgs>,
-
     //#[clap(flatten)]
     //trna_args: Option<MergeTrnaMatchArgs>,
 
@@ -209,31 +210,35 @@ where
             return Ok(());
         };
 
-        for i in root_slice.indices() {
-            let (_, ann) = &mut root_slice[i];
+        if args.refinement_options.keep_if.include_descendants() {
+            for i in root_slice.indices() {
+                let (_, ann) = &mut root_slice[i];
 
-            let assignments = ann.assigned_contigs.len() as u32 + ann.descendant_assignments;
-            let crisprs = ann.crispr_matches.len() as u32 + ann.descendant_crispr_matches;
+                let assignments = ann.assigned_contigs.len() as u32 + ann.descendant_assignments;
+                let crisprs = ann.crispr_matches.len() as u32 + ann.descendant_crispr_matches;
 
-            if let Some(parent_index) = root_slice.parent_index(i) {
-                let (_, parent_ann) = &mut root_slice[parent_index];
-                parent_ann.descendant_assignments += assignments;
-                parent_ann.descendant_crispr_matches += crisprs;
+                if let Some(parent_index) = root_slice.parent_index(i) {
+                    let (_, parent_ann) = &mut root_slice[parent_index];
+                    parent_ann.descendant_assignments += assignments;
+                    parent_ann.descendant_crispr_matches += crisprs;
+                }
             }
         }
 
-        for i in root_slice.indices().rev() {
-            if let Some(parent_index) = root_slice.parent_index(i) {
-                let (_, parent_ann) = &mut root_slice[parent_index];
+        if args.refinement_options.keep_if.include_ascendants() {
+            for i in root_slice.indices().rev() {
+                if let Some(parent_index) = root_slice.parent_index(i) {
+                    let (_, parent_ann) = &mut root_slice[parent_index];
 
-                let assignments =
-                    parent_ann.assigned_contigs.len() as u32 + parent_ann.ascendant_assignments;
-                let crisprs =
-                    parent_ann.crispr_matches.len() as u32 + parent_ann.ascendant_crispr_matches;
+                    let assignments =
+                        parent_ann.assigned_contigs.len() as u32 + parent_ann.ascendant_assignments;
+                    let crisprs = parent_ann.crispr_matches.len() as u32
+                        + parent_ann.ascendant_crispr_matches;
 
-                let (_, ann) = &mut root_slice[i];
-                ann.ascendant_assignments += assignments;
-                ann.ascendant_crispr_matches += crisprs;
+                    let (_, ann) = &mut root_slice[i];
+                    ann.ascendant_assignments += assignments;
+                    ann.ascendant_crispr_matches += crisprs;
+                }
             }
         }
 
@@ -251,18 +256,15 @@ impl<VI: Resolver, HI: Resolver> MetagenomicEvidence<VI, HI> {
         virus_sym: Option<VirusSymbol>,
         crispr_matches: &[(HostSymbol, VirusSymbol)],
     ) -> impl Iterator<Item = HostSymbol> + '_ {
-
         // If virus_sym is none, we assume there is no CRISPR info.
         // Otherwise it would have been already interned.
 
-        virus_sym
-            .into_iter()
-            .flat_map(|virus_sym| {
-                crispr_matches
-                    .iter()
-                    .filter(move |(_host, virus)| *virus == virus_sym)
-                    .map(|(host, _virus)| *host)
-            })
+        virus_sym.into_iter().flat_map(|virus_sym| {
+            crispr_matches
+                .iter()
+                .filter(move |(_host, virus)| *virus == virus_sym)
+                .map(|(host, _virus)| *host)
+        })
     }
 
     pub fn refine_and_enrich<Tax: Taxonomy>(
@@ -271,7 +273,6 @@ impl<VI: Resolver, HI: Resolver> MetagenomicEvidence<VI, HI> {
         virus_sym: Option<VirusSymbol>,
         node: NodeId,
     ) -> Option<PredictionEvidence> {
-
         let ann_slice = self.ann_pool.as_ref()?.slice_clade(tax, node)?;
         let node_index = ann_slice.global_lca_index();
 
@@ -280,13 +281,19 @@ impl<VI: Resolver, HI: Resolver> MetagenomicEvidence<VI, HI> {
 
         let node_ann = ann_slice.lca();
         assigned_contigs.extend(&node_ann.assigned_contigs);
-        crispr_matches.extend(Self::filter_crispr_matches(virus_sym, &node_ann.crispr_matches));
+        crispr_matches.extend(Self::filter_crispr_matches(
+            virus_sym,
+            &node_ann.crispr_matches,
+        ));
 
         if node_ann.descendant_assignments > 0 {
             // skip(1) because we already have ours
             for (_desc, desc_ann) in ann_slice.iter().rev().skip(1) {
                 assigned_contigs.extend(&desc_ann.assigned_contigs);
-                crispr_matches.extend(Self::filter_crispr_matches(virus_sym, &desc_ann.crispr_matches));
+                crispr_matches.extend(Self::filter_crispr_matches(
+                    virus_sym,
+                    &desc_ann.crispr_matches,
+                ));
             }
         }
 
@@ -302,7 +309,10 @@ impl<VI: Resolver, HI: Resolver> MetagenomicEvidence<VI, HI> {
 
                     let (_asc, asc_ann) = &root_slice[i];
                     assigned_contigs.extend(&asc_ann.assigned_contigs);
-                    crispr_matches.extend(Self::filter_crispr_matches(virus_sym, &asc_ann.crispr_matches));
+                    crispr_matches.extend(Self::filter_crispr_matches(
+                        virus_sym,
+                        &asc_ann.crispr_matches,
+                    ));
                 }
             }
         }
@@ -314,7 +324,10 @@ impl<VI: Resolver, HI: Resolver> MetagenomicEvidence<VI, HI> {
         crispr_matches.dedup();
 
         if !assigned_contigs.is_empty() || !crispr_matches.is_empty() {
-            Some(PredictionEvidence { assigned_contigs, crispr_matches })
+            Some(PredictionEvidence {
+                assigned_contigs,
+                crispr_matches,
+            })
         } else {
             None
         }
@@ -328,8 +341,7 @@ where
     if tax.find_rank(node) == Some(rank_sym) {
         Some(node)
     } else {
-        tax
-            .strict_ancestors(node)
+        tax.strict_ancestors(node)
             .find(move |ancestor| tax.find_rank(*ancestor) == Some(rank_sym))
     }
 }
@@ -341,7 +353,7 @@ fn adjust_prediction_to_rank_with_names<'a, Tax>(
     class_name: Option<&'a str>,
 ) -> Option<(NodeId, Option<&'a str>)>
 where
-    Tax: LabeledTaxonomy
+    Tax: LabeledTaxonomy,
 {
     let ancestor_at_rank = adjust_prediction_to_rank(tax, rank_sym, node)?;
 
